@@ -13,19 +13,19 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Polar Analysis", "0.7.4"
+APP_TITLE, APP_VERSION = "Nightjar Polar Analysis", "0.7.4b"
 DEFAULT_FILES = {
-    "log":"0_MASTER LOG FILE.csv",
-    "polar":"20260807 - A31 Polar for Expedition -REDUCED TARGETS - max tws 35 kt.txt",
-    "events":"20260821_events_export.csv",
-    "event_list":"Event List.txt",
-    "tests":"20260821_Tests_Export.csv",
-    "sail_chart":"20260728 - A31-SAILCHART.xml",
-    "logo":"Nightjar Logo 2025.jpg",
+    "log":"logfile.csv",
+    "polar":"Polar.txt",
+    "events":"EventData.csv",
+    "event_list":"EventList.txt",
+    "tests":"TestData.csv",
+    "sail_chart":"SailChart.xml",
+    "logo":"Logo.jpg",
 }
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
+DATA_DIR = Path("/mnt/Data")
 ALIASES = {
     "timestamp":["utc","time","timestamp","datetime"],
     "bsp":["bsp","boat speed","log bsp"],
