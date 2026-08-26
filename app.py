@@ -25,7 +25,7 @@ DEFAULT_FILES = {
 }
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path("/mnt/Data")
+DATA_DIR = Path("/Data")
 ALIASES = {
     "timestamp":["utc","time","timestamp","datetime"],
     "bsp":["bsp","boat speed","log bsp"],
