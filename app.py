@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.9"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.10"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -21,7 +21,7 @@ DEFAULT_FILES = {
     "event_list":"EventList.txt",
     "tests":"TestData.csv",
     "sail_chart":"SailChart.xml",
-    "logo":"Logo.jpg",
+    "logo":"Logo.png",
 }
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1062,6 +1062,9 @@ def require_password():
     if st.session_state.get("nightjar_authenticated", False):
         return True
     expected_hash = _password_config()
+    st.markdown("<style>.stApp{text-align:center;}</style>", unsafe_allow_html=True)
+    logo_path = DATA_DIR / DEFAULT_FILES["logo"]
+    if logo_path.exists(): st.image(str(logo_path), width=180)
     st.title(APP_TITLE)
     st.caption(f"Version {APP_VERSION} · Authorised access only")
     if not expected_hash:
@@ -1088,11 +1091,7 @@ def main():
     st.markdown(CSS, unsafe_allow_html=True)
     if not require_password():
         st.stop()
-    st.sidebar.markdown(
-        f"<div class='nightjar-side-title'>{APP_TITLE}</div>"
-        f"<div class='nightjar-side-caption'>Archambault A31 racing yacht performance review<br>Version {APP_VERSION}</div>",
-        unsafe_allow_html=True,
-    )
+    pass
     if st.sidebar.button("Sign out", key="nightjar_sign_out"):
         st.session_state["nightjar_authenticated"] = False
         st.rerun()
@@ -1193,6 +1192,8 @@ def main():
                 trim_data = st.toggle("Trim data by time", value=False, key="side_trim_data")
                 start_t = st.time_input("Start time", value=time(0, 0), key="side_start_time", disabled=not trim_data)
                 end_t = st.time_input("End time", value=time(23, 59), key="side_end_time", disabled=not trim_data)
+                for _msg in st.session_state.get("pending_gun_warnings", []):
+                    st.warning(_msg)
             else:
                 dates, start_t, end_t = None, time(0, 0), time(23, 59)
         else:
@@ -1205,8 +1206,7 @@ def main():
             selected_event_dates = selected_rows["date"].tolist()
             filtered = filtered[pd.to_datetime(filtered[ts]).dt.date.isin(selected_event_dates)]
             filtered, gun_warnings = apply_gun_filter_for_dates(filtered, ts, events, selected_event_dates)
-            for msg in gun_warnings:
-                st.sidebar.warning(msg)
+            pending_gun_warnings = gun_warnings
             if trim_data:
                 row_times = pd.to_datetime(filtered[ts]).dt.time
                 filtered = filtered[(row_times >= start_t) & (row_times <= end_t)]
@@ -1227,6 +1227,7 @@ def main():
     st.session_state["nightjar_max_plot_points"] = int(max_plot_points)
     st.session_state["nightjar_performance_mode"] = bool(performance_mode)
     multi_event = len(selected_events) > 1
+    st.session_state["pending_gun_warnings"] = locals().get("pending_gun_warnings", [])
 
     debrief_text = read_debrief_file(src.get("debrief"))
     # A single active page is executed per rerun. Streamlit tabs execute every tab,
@@ -1240,6 +1241,7 @@ def main():
     div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover{color:#f28c28!important;}
     </style>
     """, unsafe_allow_html=True)
+    st.markdown("""<style>div[role=radiogroup]{border-bottom:none!important;} div[role=radiogroup] label{border:2px solid #666;padding:8px 16px;border-radius:10px 10px 0 0;margin-right:4px;} div[role=radiogroup] label:has(input:checked){border-color:#f28c28;background:rgba(242,140,40,.15);} </style>""",unsafe_allow_html=True)
     active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
     previous_page = st.session_state.get("nightjar_previous_page")
     if previous_page != active_page:
@@ -1586,11 +1588,11 @@ def main():
         download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
         filtered_mb = dataframe_memory_mb(filtered)
         if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.9.csv", "text/csv", key="download_filtered")
+            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.10.csv", "text/csv", key="download_filtered")
         else:
             st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.9.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.10.json", "application/json", key="download_session")
     # Refresh after the active page has been built so the sidebar reports the
     # process resident set, including the current plot's temporary objects.
     gc.collect()
