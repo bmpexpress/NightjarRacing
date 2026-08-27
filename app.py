@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.10.5"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.10.6"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -1241,15 +1241,41 @@ def main():
     # A single active page is executed per rerun. Streamlit tabs execute every tab,
     # including hidden plotting code, which was the main source of temporary RAM growth.
     page_names = ["Overview","Event summary","Polar analysis","GPS track","Variable plot","Files and sail chart"]
+    # Style only the top-level analysis page selector as a clean navigation row.
+    # The row has one theme-colour rule beneath it; labels have no boxes.
     st.markdown("""
     <style>
-    div[data-testid="stRadio"]:has(input[value="Overview"]) div[role="radiogroup"]{gap:1.25rem;border-bottom:1px solid rgba(242,140,40,.55);padding-bottom:0;}
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label{padding:.55rem .15rem;border:0!important;border-radius:0!important;background:transparent!important;cursor:pointer;}
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label:has(input:checked){color:#f28c28!important;border-bottom:3px solid #f28c28!important;}
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover{color:#f28c28!important;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) div[role="radiogroup"] {
+      gap:1.25rem;
+      border-bottom:2px solid var(--nightjar-orange) !important;
+      padding-bottom:0;
+    }
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label {
+      padding:.55rem .15rem;
+      margin-right:0;
+      border:0 !important;
+      border-radius:0 !important;
+      outline:0 !important;
+      background:transparent !important;
+      box-shadow:none !important;
+      cursor:pointer;
+    }
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:has(input:checked) {
+      color:var(--nightjar-orange) !important;
+      background:transparent !important;
+      box-shadow:none !important;
+      font-weight:700;
+    }
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover,
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:focus-within {
+      color:var(--nightjar-orange) !important;
+      border:0 !important;
+      outline:0 !important;
+      background:transparent !important;
+      box-shadow:none !important;
+    }
     </style>
     """, unsafe_allow_html=True)
-    st.markdown("""<style>div[role=radiogroup]{border-bottom:none!important;} div[role=radiogroup] label{border:2px solid #666;padding:8px 16px;border-radius:10px 10px 0 0;margin-right:4px;} div[role=radiogroup] label:has(input:checked){border-color:#f28c28;background:rgba(242,140,40,.15);} </style>""",unsafe_allow_html=True)
     active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
     previous_page = st.session_state.get("nightjar_previous_page")
     if previous_page != active_page:
@@ -1596,11 +1622,11 @@ def main():
         download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
         filtered_mb = dataframe_memory_mb(filtered)
         if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.10.5.csv", "text/csv", key="download_filtered")
+            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.10.6.csv", "text/csv", key="download_filtered")
         else:
             st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.10.5.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.10.6.json", "application/json", key="download_session")
     # Refresh after the active page has been built so the sidebar reports the
     # process resident set, including the current plot's temporary objects.
     gc.collect()
