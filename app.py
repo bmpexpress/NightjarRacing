@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.6"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.7"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -163,7 +163,7 @@ def local_cache_path_for(path):
     p = Path(path)
     stat = p.stat()
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.stem)
-    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_076.parquet")
+    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_077.parquet")
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -515,7 +515,7 @@ def parse_standard_stream(src, chunk_rows=None):
 
 
 def parse_log(src):
-    """Sequential, memory-bounded log loader used by Nightjar 0.7.6."""
+    """Sequential, memory-bounded log loader used by Nightjar 0.7.7."""
     if _is_sparse_log(src):
         return parse_sparse_stream(src)
     try:
@@ -711,32 +711,47 @@ def point_filter(df, twa_col, selection):
     a = signed_twa(df[twa_col]).abs(); return df[a <= 90] if selection.startswith("Upwind") else df[a > 90]
 
 def average_with_ranges(df, ts, columns, seconds, tolerances=None, signed_twa_col=None):
-    """Averaging with duplicate-column protection and non-inplace masks."""
-    if seconds <= 1 or not ts or ts not in df or not pd.api.types.is_datetime64_any_dtype(df[ts]):
-        return df.copy(deep=False), "raw"
+    """Return only requested channels, using one compact grouped aggregation.
+
+    The raw path is also column-limited. This prevents plotting pages from retaining
+    a shallow view of every channel in a wide log.
+    """
     tolerances = tolerances or {}
     clean_columns = []
     for c in columns:
         if c and c in df.columns and c not in clean_columns and c != ts:
             clean_columns.append(c)
-    cols = [ts] + clean_columns
-    d = df[cols].dropna(subset=[ts]).copy()
+    raw_columns = ([ts] if ts and ts in df.columns else []) + clean_columns
+    if not raw_columns:
+        return df.iloc[:, 0:0].copy(deep=False), "raw"
+    if seconds <= 1 or not ts or ts not in df or not pd.api.types.is_datetime64_any_dtype(df[ts]):
+        return df.loc[:, raw_columns].copy(deep=False), "raw"
+
+    valid_time = df[ts].notna()
+    d = df.loc[valid_time, raw_columns].copy()
+    del valid_time
+    for c in clean_columns:
+        d[c] = pd.to_numeric(d[c], errors="coerce", downcast="float")
     if signed_twa_col and signed_twa_col in d:
         d[signed_twa_col] = signed_twa(d[signed_twa_col])
-    for c in clean_columns:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    value_cols = [c for c in clean_columns if c in d]
-    if not value_cols:
-        return df.copy(), "raw"
-    rs = d.set_index(ts).sort_index()[value_cols]
-    means = rs.resample(f"{int(seconds)}s").mean()
-    ranges = rs.resample(f"{int(seconds)}s").agg(lambda x: x.max() - x.min())
-    keep = pd.Series(True, index=means.index)
+    if not clean_columns:
+        return df.loc[:, raw_columns].copy(deep=False), "raw"
+    if not d[ts].is_monotonic_increasing:
+        d.sort_values(ts, inplace=True, kind="stable")
+
+    grouped = d.set_index(ts)[clean_columns].resample(f"{int(seconds)}s").agg(["mean", "min", "max"])
+    means = grouped.xs("mean", axis=1, level=1)
+    minima = grouped.xs("min", axis=1, level=1)
+    maxima = grouped.xs("max", axis=1, level=1)
+    keep = np.ones(len(means), dtype=bool)
     for col, tol in tolerances.items():
-        if col in ranges.columns and tol is not None:
-            comparison = pd.to_numeric(ranges[col], errors="coerce") <= float(tol)
-            keep = keep & comparison.fillna(False)
-    out = means.loc[keep].dropna(how="all").reset_index()
+        if col in means.columns and tol is not None:
+            span = (maxima[col] - minima[col]).to_numpy(dtype=np.float32, na_value=np.nan)
+            keep &= np.isfinite(span) & (span <= float(tol))
+    out = means.iloc[np.flatnonzero(keep)].dropna(how="all").reset_index()
+    optimise_dtypes(out)
+    del d, grouped, means, minima, maxima, keep
+    gc.collect()
     return out, f"{seconds}s average"
 
 def half_polar_sailing_plot(df, m, polar, target, y_range=None):
@@ -776,13 +791,17 @@ def half_polar_sailing_plot(df, m, polar, target, y_range=None):
         fig.add_annotation(x=1.04*r_max*np.sin(np.deg2rad(ang)), y=1.04*r_max*np.cos(np.deg2rad(ang)), text=str(ang), showarrow=False, font=dict(color="white", size=11))
 
     if bsp and twa and not df.empty:
-        d = df.dropna(subset=[bsp, twa]).copy()
+        radial = pd.to_numeric(df[bsp], errors="coerce").to_numpy(dtype=np.float32, na_value=np.nan)
+        angle_valid = pd.to_numeric(df[twa], errors="coerce").notna().to_numpy()
+        valid_positions = np.flatnonzero(angle_valid & np.isfinite(radial) & (radial >= r_min) & (radial <= r_max))
+        plot_limit = int(st.session_state.get("nightjar_max_plot_points", 12000))
+        if len(valid_positions) > plot_limit:
+            valid_positions = np.sort(np.random.default_rng(42).choice(valid_positions, plot_limit, replace=False))
+        plot_columns = [c for c in (bsp, twa, tws, vmg) if c and c in df.columns]
+        d = df.iloc[valid_positions].loc[:, plot_columns].copy()
+        del radial, angle_valid, valid_positions
         d["_theta"] = signed_twa(d[twa]).abs().clip(0, 180)
-        d["_r"] = pd.to_numeric(d[bsp], errors="coerce")
-        d = d.dropna(subset=["_theta", "_r"])
-        d = d[(d["_r"] >= r_min) & (d["_r"] <= r_max)]
-        if len(d) > 12000:
-            d = d.sample(12000, random_state=42)
+        d["_r"] = pd.to_numeric(d[bsp], errors="coerce", downcast="float")
         d["_x"] = d["_r"] * np.sin(np.deg2rad(d["_theta"]))
         d["_y"] = d["_r"] * np.cos(np.deg2rad(d["_theta"]))
         d["_vmg_hover"] = pd.to_numeric(d[vmg], errors="coerce") if vmg and vmg in d else d["_r"] * np.cos(np.deg2rad(d["_theta"]))
@@ -805,13 +824,18 @@ def half_polar_sailing_plot(df, m, polar, target, y_range=None):
 
 def polar_plot(df, m, polar, target, half, plot_space, y_range=None):
     bsp, twa, tws, awa, vmg = [m.get(k) for k in ("bsp", "twa", "tws", "awa", "vmg")]
-    d = df.copy(); fig = go.Figure()
+    fig = go.Figure()
     if half and plot_space == "Polar":
         return half_polar_sailing_plot(df, m, polar, target, y_range)
-    if bsp and twa and not d.empty:
-        d = d.dropna(subset=[bsp, twa]).copy(); d["Angle"] = signed_twa(d[twa]); d["Plot angle"] = d.Angle.abs() if half else d.Angle
+    if bsp and twa and not df.empty:
+        valid_positions = np.flatnonzero(df[bsp].notna().to_numpy() & df[twa].notna().to_numpy())
         plot_limit = int(st.session_state.get("nightjar_max_plot_points", 12000))
-        if len(d) > plot_limit: d = d.sample(plot_limit, random_state=42)
+        if len(valid_positions) > plot_limit:
+            valid_positions = np.sort(np.random.default_rng(42).choice(valid_positions, plot_limit, replace=False))
+        plot_columns = [c for c in (bsp, twa, tws, vmg) if c and c in df.columns]
+        d = df.iloc[valid_positions].loc[:, plot_columns].copy()
+        del valid_positions
+        d["Angle"] = signed_twa(d[twa]); d["Plot angle"] = d.Angle.abs() if half else d.Angle
         d["_vmg_hover"] = pd.to_numeric(d[vmg], errors="coerce") if vmg and vmg in d else pd.to_numeric(d[bsp], errors="coerce") * np.cos(np.deg2rad(d["Angle"]))
         d["_tws_hover"] = pd.to_numeric(d[tws], errors="coerce") if tws and tws in d else np.nan
         hover_data = np.column_stack([d["_vmg_hover"], d["_tws_hover"]])
@@ -1044,6 +1068,8 @@ def main():
     if st.sidebar.button("Sign out", key="nightjar_sign_out"):
         st.session_state["nightjar_authenticated"] = False
         st.rerun()
+    memory_placeholder = st.sidebar.empty()
+    memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
     logo = DATA_DIR / DEFAULT_FILES["logo"]
     if logo.exists(): st.sidebar.image(str(logo), width="stretch")
     st.sidebar.header("Input files")
@@ -1060,19 +1086,18 @@ def main():
             f"{source_rows:,} data rows (approximately every {sampling_stride:,}th row). "
             "Date/time coverage is preserved, but summaries use the retained sample."
         )
-    st.sidebar.caption(
-        f"Log RAM: {dataframe_memory_mb(df):.0f} MiB · "
-        f"rows retained: {len(df):,}/{source_rows:,} · stride: {sampling_stride:,}"
-    )
+    memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
     events = load_events_fast(src["events"])
     event_list = load_event_list_fast(src["event_list"])
     polar = load_polar_fast(src["polar"])
     df = ensure_vmg_pct(df, polar)
+    # Resolve saved mappings before rendering the filter. The mapping controls are
+    # deliberately rendered afterwards so they appear below the event filter.
     m = detect_columns(df)
-    st.sidebar.subheader("Column mapping")
-    for k in ("timestamp","bsp","twa","tws","awa","vmg","vmg_pct","heel","drift","lat","lon"):
-        opts = [None] + list(df.columns); cur = m.get(k)
-        m[k] = st.sidebar.selectbox(k.upper(), opts, index=opts.index(cur) if cur in opts else 0, format_func=lambda x:"Not mapped" if x is None else str(x), key=f"map_{k}")
+    mapping_keys = ("timestamp","bsp","twa","tws","awa","vmg","vmg_pct","heel","drift","lat","lon")
+    for k in mapping_keys:
+        saved = st.session_state.get(f"map_{k}", m.get(k))
+        m[k] = saved if saved is None or saved in df.columns else m.get(k)
     ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
     filtered = df
     selected_events = []
@@ -1101,8 +1126,8 @@ def main():
                     dates = st.date_input("Date range", value=(good.min().date(), good.max().date()), min_value=good.min().date(), max_value=good.max().date(), key="side_date_range")
                 else:
                     dates = None
-                start_t = st.time_input("Start time", value=good.min().time().replace(microsecond=0), key="side_start_time")
-                end_t = st.time_input("End time", value=good.max().time().replace(microsecond=0), key="side_end_time")
+                start_t = st.time_input("Start time", value=time(0, 0), key="side_start_time")
+                end_t = st.time_input("End time", value=time(23, 59), key="side_end_time")
                 st.form_submit_button("Apply filters")
 
             if selected_events:
@@ -1119,11 +1144,25 @@ def main():
                     start = pd.Timestamp.combine(dates[0], start_t); end = pd.Timestamp.combine(dates[1], end_t)
                     if end < start: st.sidebar.warning("End time is before start time; no time filter applied.")
                     else: filtered = filtered[filtered[ts].between(start,end)]
+
+    st.sidebar.subheader("Column mapping")
+    for k in mapping_keys:
+        opts = [None] + list(df.columns); cur = m.get(k)
+        m[k] = st.sidebar.selectbox(k.upper(), opts, index=opts.index(cur) if cur in opts else 0, format_func=lambda x:"Not mapped" if x is None else str(x), key=f"map_{k}")
+    ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
     st.session_state["nightjar_max_plot_points"] = int(max_plot_points)
     st.session_state["nightjar_performance_mode"] = bool(performance_mode)
+
     debrief_text = read_debrief_file(src.get("debrief"))
-    ov,summary,po,gps,var,files = st.tabs(["Overview","Event summary","Polar analysis","GPS track","Variable plot","Files and sail chart"])
-    with ov:
+    # A single active page is executed per rerun. Streamlit tabs execute every tab,
+    # including hidden plotting code, which was the main source of temporary RAM growth.
+    page_names = ["Overview","Event summary","Polar analysis","GPS track","Variable plot","Files and sail chart"]
+    active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
+    previous_page = st.session_state.get("nightjar_previous_page")
+    if previous_page != active_page:
+        st.session_state["nightjar_previous_page"] = active_page
+        gc.collect()
+    if active_page == "Overview":
         ms = st.columns(5); ms[0].metric("Rows", f"{len(filtered):,}"); ms[1].metric("Mean BSP", f"{filtered[bsp].mean():.2f} kt" if bsp else "n/a"); ms[2].metric("Mean TWS", f"{filtered[tws].mean():.1f} kt" if tws else "n/a"); ms[3].metric("Mean VMG", f"{filtered[vmg].mean():.2f} kt" if vmg else "n/a"); ms[4].metric("Channels", len(df.columns))
         if ts:
             cols = [c for c in (bsp,tws,vmg,vmg_pct,heel,twa) if c]
@@ -1131,7 +1170,7 @@ def main():
                 overview_plot_df = downsample_rows(filtered, max_plot_points) if performance_mode else filtered
                 long = overview_plot_df[[ts]+cols].melt(ts, var_name="Channel", value_name="Value").dropna(); fig = px.line(long, x=ts, y="Value", color="Channel", title="Selected time series including VMG and TWA"); fig.update_layout(template="plotly_dark", height=430); st.plotly_chart(fig, width="stretch")
         st.dataframe(round_numeric_df(filtered.head(500)), width="stretch", height=310)
-    with summary:
+    if active_page == "Event summary":
         st.subheader("Event summary")
         summary_df, polar_summary_df, gun_df = make_event_summary(filtered, event_list if selected_events else pd.DataFrame(), events, m, polar)
         if summary_df.empty:
@@ -1155,7 +1194,7 @@ def main():
         else:
             st.info("Upload a .txt, .md or .docx debrief notes file in the sidebar to view it here.")
 
-    with po:
+    if active_page == "Polar analysis":
         c1,c2,c3,c4 = st.columns(4)
         with c1: point = st.radio("Point of sail", ["All","Upwind (0 to 90°)","Downwind (90 to 180°)"], key="polar_point")
         with c2: layout = st.radio("Polar layout", ["Full polar","Half polar (absolute TWA)"], key="polar_layout")
@@ -1173,124 +1212,133 @@ def main():
         with a1: avg_sec = st.number_input("Time averaging window (s)", min_value=1, value=1, step=1, key="polar_avg_sec")
         with a2: max_tws_var = st.number_input("Max TWS variation in window", min_value=0.0, value=99.0, step=.5, key="polar_tws_var")
         with a3: max_bsp_var = st.number_input("Max BSP variation in window", min_value=0.0, value=99.0, step=.5, key="polar_bsp_var")
-        local_data = point_filter(filtered, twa, point)
-        if tws and polar and not use_all: local_data = local_data[local_data[tws].between(target-tol, target+tol)]
         avg_cols = [c for c in [bsp,twa,tws,awa,vmg,vmg_pct,heel,drift,m.get("lat"),m.get("lon")] if c]
+        polar_cols = []
+        for c in ([ts] if ts else []) + avg_cols:
+            if c and c in filtered.columns and c not in polar_cols:
+                polar_cols.append(c)
+        local_data = point_filter(filtered.loc[:, polar_cols], twa, point)
+        if tws and polar and not use_all: local_data = local_data[local_data[tws].between(target-tol, target+tol)]
         local_data, avg_note = average_with_ranges(local_data, ts, avg_cols, int(avg_sec), {tws:max_tws_var,bsp:max_bsp_var}, signed_twa_col=twa)
         st.session_state["nightjar_avg_settings"] = {"seconds":int(avg_sec), "max_tws":max_tws_var, "max_bsp":max_bsp_var}
         st.caption(f"Plotting {len(local_data):,} records | {avg_note}. Half polar uses 0° to 180°.")
         if bsp and twa: st.plotly_chart(polar_plot(local_data, m, polar, target, layout.startswith("Half"), plot_space, (yr_min,yr_max)), width="stretch")
-    with gps:
+    if active_page == "GPS track":
         lat, lon = m.get("lat"), m.get("lon")
-        if lat and lon and filtered[[lat, lon]].dropna().shape[0] > 1:
+        if lat and lon and int((filtered[lat].notna() & filtered[lon].notna()).sum()) > 1:
             settings = st.session_state.get("nightjar_avg_settings", {"seconds": 1, "max_tws": 99.0, "max_bsp": 99.0})
-            gps_cols = filtered.select_dtypes(include=np.number).columns.tolist()
-            gps_base, avg_note = average_with_ranges(
-                filtered,
-                ts,
-                [lat, lon] + gps_cols,
-                int(settings["seconds"]),
-                {tws: settings["max_tws"], bsp: settings["max_bsp"]},
-                signed_twa_col=twa,
-            )
-            valid_positions = np.flatnonzero(gps_base[lat].notna().to_numpy() & gps_base[lon].notna().to_numpy())
-            if len(valid_positions) > 10000:
-                valid_positions = valid_positions[::math.ceil(len(valid_positions) / 10000)]
-            d = gps_base.iloc[valid_positions].copy()
-            del valid_positions
-            if ts and ts in d:
-                d["Time"] = pd.to_datetime(d[ts], errors="coerce").dt.round("s").dt.strftime("%d-%b-%Y %H:%M:%S")
-
-            nums = d.select_dtypes(include=np.number).columns.tolist()
+            nums = filtered.select_dtypes(include=np.number).columns.tolist()
             default_colour = vmg if vmg in nums else (bsp if bsp in nums else (nums[0] if nums else None))
             if not nums:
                 st.warning("No numeric channels are available to colour the GPS track.")
-                st.stop()
+            else:
+                g1, g2, g3, g4 = st.columns(4)
+                with g1:
+                    colour = st.selectbox("Colour track by", nums, index=nums.index(default_colour) if default_colour in nums else 0, key="gps_colour_by")
+                with g2:
+                    abs_colour = st.checkbox("Use absolute colour values", key="gps_abs_colour_values")
 
-            g1, g2, g3, g4 = st.columns(4)
-            with g1:
-                colour = st.selectbox("Colour track by", nums, index=nums.index(default_colour) if default_colour in nums else 0, key="gps_colour_by")
-            with g2:
-                abs_colour = st.checkbox("Use absolute colour values", key="gps_abs_colour_values")
-            colour_plot = f"abs({colour})" if abs_colour else colour
-            if abs_colour:
-                d[colour_plot] = d[colour].abs()
-            vals = pd.to_numeric(d[colour_plot], errors="coerce").dropna() if colour_plot in d else pd.Series(dtype=float)
-            if "gps_colour_last_field" not in st.session_state or st.session_state["gps_colour_last_field"] != colour_plot:
-                st.session_state["gps_colour_last_field"] = colour_plot
-                st.session_state["gps_colour_min"] = float(vals.quantile(.02)) if not vals.empty else 0.0
-                st.session_state["gps_colour_max"] = float(vals.quantile(.98)) if not vals.empty else 1.0
-            if st.button("Auto scale GPS colour to plotted data", key="gps_auto_colour_scale"):
-                st.session_state["gps_colour_min"] = float(vals.min()) if not vals.empty else 0.0
-                st.session_state["gps_colour_max"] = float(vals.max()) if not vals.empty else 1.0
-            if st.session_state.get("gps_colour_max", 1.0) <= st.session_state.get("gps_colour_min", 0.0):
-                st.session_state["gps_colour_max"] = st.session_state.get("gps_colour_min", 0.0) + 0.001
-            with g3:
-                cmin = st.number_input("Colour scale min", key="gps_colour_min")
-            with g4:
-                cmax = st.number_input("Colour scale max", key="gps_colour_max")
+                # Average only the selected colour and hover channels, rather than every
+                # numeric log channel. This is substantially smaller for wide Expedition logs.
+                gps_columns = []
+                for c in (lat, lon, colour, twa, tws, awa, heel, vmg, vmg_pct, drift, bsp):
+                    if c and c in filtered.columns and c not in gps_columns:
+                        gps_columns.append(c)
+                gps_base, avg_note = average_with_ranges(
+                    filtered,
+                    ts,
+                    gps_columns,
+                    int(settings["seconds"]),
+                    {tws: settings["max_tws"], bsp: settings["max_bsp"]},
+                    signed_twa_col=twa,
+                )
+                valid_positions = np.flatnonzero(gps_base[lat].notna().to_numpy() & gps_base[lon].notna().to_numpy())
+                gps_limit = min(10000, int(max_plot_points))
+                if len(valid_positions) > gps_limit:
+                    valid_positions = valid_positions[::math.ceil(len(valid_positions) / gps_limit)]
+                d = gps_base.iloc[valid_positions].copy()
+                del gps_base, valid_positions
+                if ts and ts in d:
+                    d["Time"] = pd.to_datetime(d[ts], errors="coerce").dt.round("s").dt.strftime("%d-%b-%Y %H:%M:%S")
+                colour_plot = f"abs({colour})" if abs_colour else colour
+                if abs_colour:
+                    d[colour_plot] = d[colour].abs()
+                vals = pd.to_numeric(d[colour_plot], errors="coerce").dropna() if colour_plot in d else pd.Series(dtype=float)
+                if "gps_colour_last_field" not in st.session_state or st.session_state["gps_colour_last_field"] != colour_plot:
+                    st.session_state["gps_colour_last_field"] = colour_plot
+                    st.session_state["gps_colour_min"] = float(vals.quantile(.02)) if not vals.empty else 0.0
+                    st.session_state["gps_colour_max"] = float(vals.quantile(.98)) if not vals.empty else 1.0
+                if st.button("Auto scale GPS colour to plotted data", key="gps_auto_colour_scale"):
+                    st.session_state["gps_colour_min"] = float(vals.min()) if not vals.empty else 0.0
+                    st.session_state["gps_colour_max"] = float(vals.max()) if not vals.empty else 1.0
+                if st.session_state.get("gps_colour_max", 1.0) <= st.session_state.get("gps_colour_min", 0.0):
+                    st.session_state["gps_colour_max"] = st.session_state.get("gps_colour_min", 0.0) + 0.001
+                with g3:
+                    cmin = st.number_input("Colour scale min", key="gps_colour_min")
+                with g4:
+                    cmax = st.number_input("Colour scale max", key="gps_colour_max")
 
-            hover_cols = [c for c in ("Time" if ts else None, twa, tws, awa, heel, vmg, vmg_pct, drift, bsp) if c and c in d]
-            hover_text = []
-            for _, row in d.iterrows():
-                parts = []
-                for col in hover_cols:
-                    val = row[col]
-                    if isinstance(val, (float, np.floating)):
-                        parts.append(f"{col}: {val:.2f}")
-                    else:
-                        parts.append(f"{col}: {val}")
-                hover_text.append("<br>".join(parts))
+                hover_cols = [c for c in ("Time" if ts else None, twa, tws, awa, heel, vmg, vmg_pct, drift, bsp) if c and c in d]
+                hover_text = []
+                for _, row in d.iterrows():
+                    parts = []
+                    for col in hover_cols:
+                        val = row[col]
+                        if isinstance(val, (float, np.floating)):
+                            parts.append(f"{col}: {val:.2f}")
+                        else:
+                            parts.append(f"{col}: {val}")
+                    hover_text.append("<br>".join(parts))
 
-            centre = {"lat": float(d[lat].mean()), "lon": float(d[lon].mean())}
+                centre = {"lat": float(d[lat].mean()), "lon": float(d[lon].mean())}
 
-            # Use pure graph_objects Scattermapbox for both the line and points.
-            # This deliberately avoids Plotly Express map figures and avoids copying any mapbox layout object,
-            # because copied mapbox layout objects were causing the browser-side 'No valid mapbox style found' error.
-            fig = go.Figure()
-            fig.add_trace(go.Scattermap(
-                lat=d[lat],
-                lon=d[lon],
-                mode="lines",
-                name="Track line",
-                line=dict(color="rgba(242,140,40,0.58)", width=2),
-                hoverinfo="skip",
-            ))
-            fig.add_trace(go.Scattermap(
-                lat=d[lat],
-                lon=d[lon],
-                mode="markers",
-                name=colour_plot,
-                text=hover_text,
-                hovertemplate="%{text}<extra></extra>",
-                marker=dict(
-                    size=8,
-                    color=d[colour_plot],
-                    colorscale="Turbo",
-                    cmin=cmin,
-                    cmax=cmax,
-                    colorbar=dict(title=colour_plot),
-                    opacity=0.82,
-                ),
-            ))
-            fig.update_layout(
-                map=dict(
-                    style="open-street-map",
-                    center=centre,
-                    zoom=10,
-                ),
-                template="plotly_dark",
-                height=675,
-                margin=dict(l=0, r=0, t=35, b=0),
-                title=f"GPS track coloured by {colour_plot} ({avg_note})",
-            )
-            st.plotly_chart(fig, width="stretch")
+                # Use pure graph_objects Scattermapbox for both the line and points.
+                # This deliberately avoids Plotly Express map figures and avoids copying any mapbox layout object,
+                # because copied mapbox layout objects were causing the browser-side 'No valid mapbox style found' error.
+                fig = go.Figure()
+                fig.add_trace(go.Scattermap(
+                    lat=d[lat],
+                    lon=d[lon],
+                    mode="lines",
+                    name="Track line",
+                    line=dict(color="rgba(242,140,40,0.58)", width=2),
+                    hoverinfo="skip",
+                ))
+                fig.add_trace(go.Scattermap(
+                    lat=d[lat],
+                    lon=d[lon],
+                    mode="markers",
+                    name=colour_plot,
+                    text=hover_text,
+                    hovertemplate="%{text}<extra></extra>",
+                    marker=dict(
+                        size=8,
+                        color=d[colour_plot],
+                        colorscale="Turbo",
+                        cmin=cmin,
+                        cmax=cmax,
+                        colorbar=dict(title=colour_plot),
+                        opacity=0.82,
+                    ),
+                ))
+                fig.update_layout(
+                    map=dict(
+                        style="open-street-map",
+                        center=centre,
+                        zoom=10,
+                    ),
+                    template="plotly_dark",
+                    height=675,
+                    margin=dict(l=0, r=0, t=35, b=0),
+                    title=f"GPS track coloured by {colour_plot} ({avg_note})",
+                )
+                st.plotly_chart(fig, width="stretch")
         else:
             st.info("Latitude and longitude are not available")
         if not events.empty:
             st.dataframe(round_numeric_df(events), width="stretch", height=240)
 
-    with var:
+    if active_page == "Variable plot":
         nums = filtered.select_dtypes(include=np.number).columns.tolist()
         if len(nums) < 2: st.info("At least two numeric variables are required")
         else:
@@ -1341,16 +1389,21 @@ def main():
                 if colour_range: marker.update(cmin=colour_range[0], cmax=colour_range[1])
                 fig = go.Figure(go.Scatterpolar(theta=vd[xn], r=vd[yn], mode="markers", marker=marker, hovertemplate=f"{xn}: %{{theta:.2f}}<br>{yn}: %{{r:.2f}}<extra></extra>")); fig.update_layout(polar=dict(angularaxis=dict(direction="clockwise", rotation=90)))
             fig.update_layout(template="plotly_dark", height=635, title=f"{yn} against {xn} ({avg_note})"); st.plotly_chart(fig, width="stretch"); st.caption(f"Displaying {len(vd):,} records")
-    with files:
+    if active_page == "Files and sail chart":
         if src["sail_chart"]:
             try: sails = load_sails_fast(src["sail_chart"]); st.plotly_chart(sail_fig(sails), width="stretch"); st.dataframe(round_numeric_df(sails), width="stretch", height=270)
             except Exception as e: st.warning(f"Sail chart could not be parsed: {e}")
         download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
         filtered_mb = dataframe_memory_mb(filtered)
         if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.6.csv", "text/csv", key="download_filtered")
+            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.7.csv", "text/csv", key="download_filtered")
         else:
             st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.6.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.7.json", "application/json", key="download_session")
+    # Refresh after the active page has been built so the sidebar reports the
+    # process resident set, including the current plot's temporary objects.
+    gc.collect()
+    memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
+
 if __name__ == "__main__": main()
