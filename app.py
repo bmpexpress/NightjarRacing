@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.8.1"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.9"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -163,7 +163,7 @@ def local_cache_path_for(path):
     p = Path(path)
     stat = p.stat()
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.stem)
-    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_077.parquet")
+    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_079.parquet")
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -515,7 +515,7 @@ def parse_standard_stream(src, chunk_rows=None):
 
 
 def parse_log(src):
-    """Sequential, memory-bounded log loader used by Nightjar 0.7.7."""
+    """Sequential, memory-bounded log loader used by Nightjar 0.7.9."""
     if _is_sparse_log(src):
         return parse_sparse_stream(src)
     try:
@@ -822,8 +822,24 @@ def half_polar_sailing_plot(df, m, polar, target, y_range=None):
     fig.update_layout(template="plotly_dark", height=690, title="Actual boat speed and target polar - half polar", xaxis=dict(title="", visible=False, range=[-0.08*r_max, 1.12*r_max], scaleanchor="y", scaleratio=1), yaxis=dict(title="", visible=False, range=[-1.12*r_max, 1.12*r_max]), margin=dict(t=80,b=55), legend=dict(orientation="h", y=-.08), annotations=list(fig.layout.annotations) + [dict(x=0, y=1.18*r_max, text="0° TWA", showarrow=False, font=dict(color="white", size=12)), dict(x=0, y=-1.18*r_max, text="180° TWA", showarrow=False, font=dict(color="white", size=12)), dict(x=1.14*r_max, y=0, text="90°", showarrow=False, font=dict(color="white", size=12))])
     return fig
 
-def polar_plot(df, m, polar, target, half, plot_space, y_range=None):
+def polar_plot(df, m, polar, target, half, plot_space, y_range=None, colour_by_event=False):
     bsp, twa, tws, awa, vmg = [m.get(k) for k in ("bsp", "twa", "tws", "awa", "vmg")]
+    if colour_by_event and "Event" in df.columns and df["Event"].nunique(dropna=True) > 1:
+        # Build the grid/target once, then append one categorical-colour trace per event.
+        combined = polar_plot(df.iloc[0:0], m, polar, target, half, plot_space, y_range, False)
+        palette = px.colors.qualitative.Plotly
+        for index, (event_name, event_data) in enumerate(df.groupby("Event", observed=True, sort=False)):
+            event_fig = polar_plot(event_data, m, None, None, half, plot_space, y_range, False)
+            for trace in event_fig.data:
+                if getattr(trace, "name", None) == "Actual":
+                    trace.name = str(event_name)
+                    trace.legendgroup = str(event_name)
+                    trace.marker.color = palette[index % len(palette)]
+                    trace.marker.showscale = False
+                    trace.marker.colorbar = None
+                    combined.add_trace(trace)
+        combined.update_layout(title="Actual boat speed coloured by event")
+        return combined
     fig = go.Figure()
     if half and plot_space == "Polar":
         return half_polar_sailing_plot(df, m, polar, target, y_range)
@@ -903,6 +919,18 @@ def apply_gun_filter_for_dates(data, ts_col, events, dates):
         return data.iloc[0:0].copy(), warnings
     return pd.concat(out_parts).sort_values(ts_col), warnings
 
+
+def add_event_labels(data, ts_col, selected_rows):
+    """Return a shallow frame with a compact Event category derived from event dates."""
+    if data is None or data.empty or not ts_col or ts_col not in data.columns or selected_rows is None or selected_rows.empty:
+        return data
+    date_to_event = {}
+    for row in selected_rows[["date", "event"]].dropna().itertuples(index=False):
+        date_to_event.setdefault(row.date, str(row.event))
+    out = data.copy(deep=False)
+    labels = pd.to_datetime(out[ts_col], errors="coerce").dt.date.map(date_to_event)
+    out["Event"] = labels.fillna("Unassigned").astype("category")
+    return out
 
 def safe_mean(df, col):
     if not col or col not in df or df.empty:
@@ -1070,23 +1098,35 @@ def main():
         st.rerun()
     st.sidebar.markdown("""
     <style>
-    [data-testid="stMetric"]{background:rgba(242,140,40,.12);border:1px solid #f28c28;border-radius:8px;padding:0.25rem 0.5rem;}
-    [data-testid="stMetricLabel"]{font-size:0.75rem;}
-    [data-testid="stMetricValue"]{font-size:1rem;color:#f28c28;}
+    section[data-testid="stSidebar"] [data-testid="stMetric"]{background:transparent;border:0;padding:0.1rem 0;}
+    section[data-testid="stSidebar"] [data-testid="stMetricLabel"]{font-size:0.72rem;color:#f28c28;}
+    section[data-testid="stSidebar"] [data-testid="stMetricValue"]{font-size:0.95rem;color:#f28c28;}
     </style>
     """, unsafe_allow_html=True)
     memory_placeholder = st.sidebar.empty()
     memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
     logo = DATA_DIR / DEFAULT_FILES["logo"]
-    if logo.exists(): st.sidebar.image(str(logo), width="stretch")
-    st.sidebar.header("Event filter")
-    st.sidebar.caption("Filters are applied before file processing and plotting.")
+    if logo.exists():
+        st.sidebar.image(str(logo), width="stretch")
+
+    # Create this container before the upload controls, then populate it after the
+    # files have been loaded. Streamlit keeps the container in this earlier position.
+    event_filter_container = st.sidebar.container()
     st.sidebar.header("Input files")
     defs = [("log","Expedition log",["csv","txt"]),("polar","Target polar",["txt","csv","pol"]),("events","Expedition events",["csv","txt"]),("event_list","Event list",["txt","csv"]),("tests","Expedition tests",["csv"]),("sail_chart","Sail selection chart",["xml"]),("debrief","Debrief notes",["txt","md","docx"])]
-    ups = {k: st.sidebar.file_uploader(n, type=t, key=f"file_{k}") for k,n,t in defs}; src = {k: (v if k == "debrief" else local(v,k)) for k,v in ups.items()}
-    if not src["log"]: st.info("Upload a log or place the reference files in the data folder in the /Data volume"); st.stop()
-    try: df = load_log_fast(src["log"])
-    except Exception as e: st.error(f"Could not read log: {e}"); st.stop()
+    ups = {k: st.sidebar.file_uploader(n, type=t, key=f"file_{k}") for k,n,t in defs}
+    src = {k: (v if k == "debrief" else local(v,k)) for k,v in ups.items()}
+    if not src["log"]:
+        with event_filter_container:
+            st.subheader("Event filters")
+            st.caption("Load a log and event list to enable filtering.")
+        st.info("Upload a log or place the reference files in the data folder in the /Data volume")
+        st.stop()
+    try:
+        df = load_log_fast(src["log"])
+    except Exception as e:
+        st.error(f"Could not read log: {e}")
+        st.stop()
     source_rows = int(df.attrs.get("nightjar_source_rows", len(df)))
     sampling_stride = int(df.attrs.get("nightjar_sampling_stride", 1))
     if sampling_stride > 1:
@@ -1100,87 +1140,134 @@ def main():
     event_list = load_event_list_fast(src["event_list"])
     polar = load_polar_fast(src["polar"])
     df = ensure_vmg_pct(df, polar)
-    # Resolve saved mappings before rendering the filter. The mapping controls are
-    # deliberately rendered afterwards so they appear below the event filter.
+
     m = detect_columns(df)
     mapping_keys = ("timestamp","bsp","twa","tws","awa","vmg","vmg_pct","heel","drift","lat","lon")
     for k in mapping_keys:
         saved = st.session_state.get(f"map_{k}", m.get(k))
         m[k] = saved if saved is None or saved in df.columns else m.get(k)
     ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
+
     filtered = df
     selected_events = []
     selected_event_dates = []
+    selected_rows = pd.DataFrame(columns=["date", "type", "event"])
     performance_mode = True
     max_plot_points = 10000
-    if ts and pd.api.types.is_datetime64_any_dtype(filtered[ts]):
-        good = filtered[ts].dropna()
-        if not good.empty:
-            st.sidebar.subheader("Event, date and time filter")
-            with st.sidebar.form("nightjar_filter_form"):
+    trim_data = False
+
+    with event_filter_container:
+        st.subheader("Event filters")
+        if ts and pd.api.types.is_datetime64_any_dtype(df[ts]):
+            good = df[ts].dropna()
+            if not good.empty:
                 performance_mode = st.checkbox("Performance mode", value=True, key="perf_mode")
-                st.caption("Performance mode limits figures to approximately 10,000 plotted points per chart to reduce browser and server memory usage.")
-                max_plot_points = st.number_input("Maximum plotted points", min_value=1000, max_value=50000, value=10000, step=1000, key="max_plot_points")
+                st.caption("Limits each figure to at most 10,000 plotted points to reduce browser and server memory use.")
+                max_plot_points = st.number_input("Maximum plotted points", min_value=1000, max_value=10000, value=10000, step=1000, key="max_plot_points")
+
                 filtered_event_list = event_list.copy()
                 if not filtered_event_list.empty and "type" in filtered_event_list.columns:
                     event_types = sorted([x for x in filtered_event_list["type"].dropna().unique().tolist() if x])
                     selected_types = st.multiselect("Event type", event_types, default=event_types, key="side_event_type_filter")
                     if selected_types:
                         filtered_event_list = filtered_event_list[filtered_event_list["type"].isin(selected_types)]
+                    else:
+                        filtered_event_list = filtered_event_list.iloc[0:0]
                 if not filtered_event_list.empty:
-                    event_options = filtered_event_list["event"].tolist()
+                    event_options = filtered_event_list["event"].dropna().astype(str).tolist()
+                    stored_events = st.session_state.get("side_event_multiselect", [])
+                    valid_stored = [name for name in stored_events if name in event_options]
+                    if valid_stored != list(stored_events):
+                        st.session_state["side_event_multiselect"] = valid_stored
                     selected_events = st.multiselect("Events", event_options, default=event_options[:1], key="side_event_multiselect")
                 else:
                     selected_events = []
+                    st.caption("No events match the selected event type.")
+
                 if not selected_events:
                     dates = st.date_input("Date range", value=(good.min().date(), good.max().date()), min_value=good.min().date(), max_value=good.max().date(), key="side_date_range")
                 else:
                     dates = None
-                start_t = st.time_input("Start time", value=time(0, 0), key="side_start_time")
-                end_t = st.time_input("End time", value=time(23, 59), key="side_end_time")
-                st.form_submit_button("Apply filters")
 
-            if selected_events:
-                selected_rows = filtered_event_list[filtered_event_list["event"].isin(selected_events)]
-                selected_event_dates = selected_rows["date"].tolist()
-                filtered = filtered[pd.to_datetime(filtered[ts]).dt.date.isin(selected_event_dates)]
-                filtered, gun_warnings = apply_gun_filter_for_dates(filtered, ts, events, selected_event_dates)
-                for msg in gun_warnings:
-                    st.sidebar.warning(msg)
-                t = pd.to_datetime(filtered[ts]).dt.time
-                filtered = filtered[(t >= start_t) & (t <= end_t)]
+                st.subheader("Trim Data")
+                trim_data = st.toggle("Trim data by time", value=False, key="side_trim_data")
+                start_t = st.time_input("Start time", value=time(0, 0), key="side_start_time", disabled=not trim_data)
+                end_t = st.time_input("End time", value=time(23, 59), key="side_end_time", disabled=not trim_data)
             else:
-                if isinstance(dates, tuple) and len(dates) == 2:
-                    start = pd.Timestamp.combine(dates[0], start_t); end = pd.Timestamp.combine(dates[1], end_t)
-                    if end < start: st.sidebar.warning("End time is before start time; no time filter applied.")
-                    else: filtered = filtered[filtered[ts].between(start,end)]
+                dates, start_t, end_t = None, time(0, 0), time(23, 59)
+        else:
+            dates, start_t, end_t = None, time(0, 0), time(23, 59)
+            st.caption("Map a timestamp column to enable event filtering.")
+
+    if ts and pd.api.types.is_datetime64_any_dtype(df[ts]):
+        if selected_events:
+            selected_rows = filtered_event_list[filtered_event_list["event"].isin(selected_events)].copy()
+            selected_event_dates = selected_rows["date"].tolist()
+            filtered = filtered[pd.to_datetime(filtered[ts]).dt.date.isin(selected_event_dates)]
+            filtered, gun_warnings = apply_gun_filter_for_dates(filtered, ts, events, selected_event_dates)
+            for msg in gun_warnings:
+                st.sidebar.warning(msg)
+            if trim_data:
+                row_times = pd.to_datetime(filtered[ts]).dt.time
+                filtered = filtered[(row_times >= start_t) & (row_times <= end_t)]
+        elif isinstance(dates, tuple) and len(dates) == 2:
+            date_start = pd.Timestamp.combine(dates[0], start_t if trim_data else time(0, 0))
+            date_end = pd.Timestamp.combine(dates[1], end_t if trim_data else time(23, 59, 59, 999999))
+            if date_end < date_start:
+                st.sidebar.warning("End time is before start time; no time trim was applied.")
+            else:
+                filtered = filtered[filtered[ts].between(date_start, date_end)]
 
     st.sidebar.subheader("Column mapping")
     for k in mapping_keys:
-        opts = [None] + list(df.columns); cur = m.get(k)
+        opts = [None] + list(df.columns)
+        cur = m.get(k)
         m[k] = st.sidebar.selectbox(k.upper(), opts, index=opts.index(cur) if cur in opts else 0, format_func=lambda x:"Not mapped" if x is None else str(x), key=f"map_{k}")
     ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
     st.session_state["nightjar_max_plot_points"] = int(max_plot_points)
     st.session_state["nightjar_performance_mode"] = bool(performance_mode)
+    multi_event = len(selected_events) > 1
 
     debrief_text = read_debrief_file(src.get("debrief"))
     # A single active page is executed per rerun. Streamlit tabs execute every tab,
     # including hidden plotting code, which was the main source of temporary RAM growth.
     page_names = ["Overview","Event summary","Polar analysis","GPS track","Variable plot","Files and sail chart"]
-    st.markdown("""<style>div[role="radiogroup"] label{padding:10px 18px;border:1px solid #f28c28;border-radius:8px;background:rgba(242,140,40,0.12);margin-right:6px;cursor:pointer;} div[role="radiogroup"] label:hover{background:rgba(242,140,40,0.2);} </style>""", unsafe_allow_html=True)
+    st.markdown("""
+    <style>
+    div[data-testid="stRadio"]:has(input[value="Overview"]) div[role="radiogroup"]{gap:1.25rem;border-bottom:1px solid rgba(242,140,40,.55);padding-bottom:0;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label{padding:.55rem .15rem;border:0!important;border-radius:0!important;background:transparent!important;cursor:pointer;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:has(input:checked){color:#f28c28!important;border-bottom:3px solid #f28c28!important;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover{color:#f28c28!important;}
+    </style>
+    """, unsafe_allow_html=True)
     active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
     previous_page = st.session_state.get("nightjar_previous_page")
     if previous_page != active_page:
         st.session_state["nightjar_previous_page"] = active_page
         gc.collect()
     if active_page == "Overview":
-        ms = st.columns(5); ms[0].metric("Rows", f"{len(filtered):,}"); ms[1].metric("Mean BSP", f"{filtered[bsp].mean():.2f} kt" if bsp else "n/a"); ms[2].metric("Mean TWS", f"{filtered[tws].mean():.1f} kt" if tws else "n/a"); ms[3].metric("Mean VMG", f"{filtered[vmg].mean():.2f} kt" if vmg else "n/a"); ms[4].metric("Channels", len(df.columns))
+        colour_by_event_overview = st.toggle("Colour by event", value=False, key="overview_colour_by_event", disabled=not multi_event) if multi_event else False
+        ms = st.columns(5)
+        ms[0].metric("Rows", f"{len(filtered):,}")
+        ms[1].metric("Mean BSP", f"{filtered[bsp].mean():.2f} kt" if bsp else "n/a")
+        ms[2].metric("Mean TWS", f"{filtered[tws].mean():.1f} kt" if tws else "n/a")
+        ms[3].metric("Mean VMG", f"{filtered[vmg].mean():.2f} kt" if vmg else "n/a")
+        ms[4].metric("Channels", len(df.columns))
         if ts:
             cols = [c for c in (bsp,tws,vmg,vmg_pct,heel,twa) if c]
             if cols:
                 overview_plot_df = downsample_rows(filtered, max_plot_points) if performance_mode else filtered
-                long = overview_plot_df[[ts]+cols].melt(ts, var_name="Channel", value_name="Value").dropna(); fig = px.line(long, x=ts, y="Value", color="Channel", title="Selected time series including VMG and TWA"); fig.update_layout(template="plotly_dark", height=430); st.plotly_chart(fig, width="stretch")
+                overview_plot_df = add_event_labels(overview_plot_df, ts, selected_rows) if colour_by_event_overview else overview_plot_df
+                id_columns = [ts] + (["Event"] if colour_by_event_overview and "Event" in overview_plot_df else [])
+                long = overview_plot_df[id_columns + cols].melt(id_columns, var_name="Channel", value_name="Value").dropna()
+                if colour_by_event_overview and "Event" in long:
+                    fig = px.line(long, x=ts, y="Value", color="Event", line_dash="Channel", title="Selected time series coloured by event")
+                else:
+                    fig = px.line(long, x=ts, y="Value", color="Channel", title="Selected time series including VMG and TWA")
+                fig.update_layout(template="plotly_dark", height=430)
+                st.plotly_chart(fig, width="stretch")
         st.dataframe(round_numeric_df(filtered.head(500)), width="stretch", height=310)
+
     if active_page == "Event summary":
         st.subheader("Event summary")
         summary_df, polar_summary_df, gun_df = make_event_summary(filtered, event_list if selected_events else pd.DataFrame(), events, m, polar)
@@ -1206,6 +1293,7 @@ def main():
             st.info("Upload a .txt, .md or .docx debrief notes file in the sidebar to view it here.")
 
     if active_page == "Polar analysis":
+        colour_by_event_polar = st.toggle("Colour by event", value=False, key="polar_colour_by_event", disabled=not multi_event) if multi_event else False
         c1,c2,c3,c4 = st.columns(4)
         with c1: point = st.radio("Point of sail", ["All","Upwind (0 to 90°)","Downwind (90 to 180°)"], key="polar_point")
         with c2: layout = st.radio("Polar layout", ["Full polar","Half polar (absolute TWA)"], key="polar_layout")
@@ -1231,10 +1319,14 @@ def main():
         local_data = point_filter(filtered.loc[:, polar_cols], twa, point)
         if tws and polar and not use_all: local_data = local_data[local_data[tws].between(target-tol, target+tol)]
         local_data, avg_note = average_with_ranges(local_data, ts, avg_cols, int(avg_sec), {tws:max_tws_var,bsp:max_bsp_var}, signed_twa_col=twa)
+        if colour_by_event_polar:
+            local_data = add_event_labels(local_data, ts, selected_rows)
         st.session_state["nightjar_avg_settings"] = {"seconds":int(avg_sec), "max_tws":max_tws_var, "max_bsp":max_bsp_var}
         st.caption(f"Plotting {len(local_data):,} records | {avg_note}. Half polar uses 0° to 180°.")
-        if bsp and twa: st.plotly_chart(polar_plot(local_data, m, polar, target, layout.startswith("Half"), plot_space, (yr_min,yr_max)), width="stretch")
+        if bsp and twa:
+            st.plotly_chart(polar_plot(local_data, m, polar, target, layout.startswith("Half"), plot_space, (yr_min,yr_max), colour_by_event_polar), width="stretch")
     if active_page == "GPS track":
+        colour_by_event_gps = st.toggle("Colour by event", value=False, key="gps_colour_by_event", disabled=not multi_event) if multi_event else False
         lat, lon = m.get("lat"), m.get("lon")
         if lat and lon and int((filtered[lat].notna() & filtered[lon].notna()).sum()) > 1:
             settings = st.session_state.get("nightjar_avg_settings", {"seconds": 1, "max_tws": 99.0, "max_bsp": 99.0})
@@ -1245,9 +1337,9 @@ def main():
             else:
                 g1, g2, g3, g4 = st.columns(4)
                 with g1:
-                    colour = st.selectbox("Colour track by", nums, index=nums.index(default_colour) if default_colour in nums else 0, key="gps_colour_by")
+                    colour = st.selectbox("Colour track by", nums, index=nums.index(default_colour) if default_colour in nums else 0, key="gps_colour_by", disabled=colour_by_event_gps)
                 with g2:
-                    abs_colour = st.checkbox("Use absolute colour values", key="gps_abs_colour_values")
+                    abs_colour = st.checkbox("Use absolute colour values", key="gps_abs_colour_values", disabled=colour_by_event_gps)
 
                 # Average only the selected colour and hover channels, rather than every
                 # numeric log channel. This is substantially smaller for wide Expedition logs.
@@ -1271,6 +1363,8 @@ def main():
                 del gps_base, valid_positions
                 if ts and ts in d:
                     d["Time"] = pd.to_datetime(d[ts], errors="coerce").dt.round("s").dt.strftime("%d-%b-%Y %H:%M:%S")
+                if colour_by_event_gps:
+                    d = add_event_labels(d, ts, selected_rows)
                 colour_plot = f"abs({colour})" if abs_colour else colour
                 if abs_colour:
                     d[colour_plot] = d[colour].abs()
@@ -1285,9 +1379,9 @@ def main():
                 if st.session_state.get("gps_colour_max", 1.0) <= st.session_state.get("gps_colour_min", 0.0):
                     st.session_state["gps_colour_max"] = st.session_state.get("gps_colour_min", 0.0) + 0.001
                 with g3:
-                    cmin = st.number_input("Colour scale min", key="gps_colour_min")
+                    cmin = st.number_input("Colour scale min", key="gps_colour_min", disabled=colour_by_event_gps)
                 with g4:
-                    cmax = st.number_input("Colour scale max", key="gps_colour_max")
+                    cmax = st.number_input("Colour scale max", key="gps_colour_max", disabled=colour_by_event_gps)
 
                 hover_cols = [c for c in ("Time" if ts else None, twa, tws, awa, heel, vmg, vmg_pct, drift, bsp) if c and c in d]
                 hover_text = []
@@ -1306,42 +1400,32 @@ def main():
                 # Use pure graph_objects Scattermapbox for both the line and points.
                 # This deliberately avoids Plotly Express map figures and avoids copying any mapbox layout object,
                 # because copied mapbox layout objects were causing the browser-side 'No valid mapbox style found' error.
+                d["_Hover"] = hover_text
                 fig = go.Figure()
                 fig.add_trace(go.Scattermap(
-                    lat=d[lat],
-                    lon=d[lon],
-                    mode="lines",
-                    name="Track line",
-                    line=dict(color="rgba(242,140,40,0.58)", width=2),
-                    hoverinfo="skip",
+                    lat=d[lat], lon=d[lon], mode="lines", name="Track line",
+                    line=dict(color="rgba(242,140,40,0.58)", width=2), hoverinfo="skip",
                 ))
-                fig.add_trace(go.Scattermap(
-                    lat=d[lat],
-                    lon=d[lon],
-                    mode="markers",
-                    name=colour_plot,
-                    text=hover_text,
-                    hovertemplate="%{text}<extra></extra>",
-                    marker=dict(
-                        size=8,
-                        color=d[colour_plot],
-                        colorscale="Turbo",
-                        cmin=cmin,
-                        cmax=cmax,
-                        colorbar=dict(title=colour_plot),
-                        opacity=0.82,
-                    ),
-                ))
+                if colour_by_event_gps and "Event" in d:
+                    palette = px.colors.qualitative.Plotly
+                    for colour_index, (event_name, event_data) in enumerate(d.groupby("Event", observed=True, sort=False)):
+                        fig.add_trace(go.Scattermap(
+                            lat=event_data[lat], lon=event_data[lon], mode="markers", name=str(event_name),
+                            text=event_data["_Hover"], hovertemplate="%{text}<extra></extra>",
+                            marker=dict(size=8, color=palette[colour_index % len(palette)], opacity=0.82),
+                        ))
+                    gps_title = f"GPS track coloured by event ({avg_note})"
+                else:
+                    fig.add_trace(go.Scattermap(
+                        lat=d[lat], lon=d[lon], mode="markers", name=colour_plot,
+                        text=d["_Hover"], hovertemplate="%{text}<extra></extra>",
+                        marker=dict(size=8, color=d[colour_plot], colorscale="Turbo", cmin=cmin, cmax=cmax,
+                                    colorbar=dict(title=colour_plot), opacity=0.82),
+                    ))
+                    gps_title = f"GPS track coloured by {colour_plot} ({avg_note})"
                 fig.update_layout(
-                    map=dict(
-                        style="open-street-map",
-                        center=centre,
-                        zoom=10,
-                    ),
-                    template="plotly_dark",
-                    height=675,
-                    margin=dict(l=0, r=0, t=35, b=0),
-                    title=f"GPS track coloured by {colour_plot} ({avg_note})",
+                    map=dict(style="open-street-map", center=centre, zoom=10),
+                    template="plotly_dark", height=675, margin=dict(l=0, r=0, t=35, b=0), title=gps_title,
                 )
                 st.plotly_chart(fig, width="stretch")
         else:
@@ -1350,56 +1434,151 @@ def main():
             st.dataframe(round_numeric_df(events), width="stretch", height=240)
 
     if active_page == "Variable plot":
+        colour_by_event_var = st.toggle("Colour by event", value=False, key="var_colour_by_event", disabled=not multi_event) if multi_event else False
         nums = filtered.select_dtypes(include=np.number).columns.tolist()
-        if len(nums) < 2: st.info("At least two numeric variables are required")
+        if len(nums) < 2:
+            st.info("At least two numeric variables are required")
         else:
             v1,v2,v3,v4 = st.columns(4)
-            with v1: x = st.selectbox("Angular / X variable", nums, index=nums.index(twa) if twa in nums else 0, key="var_x"); absx = st.checkbox("Use absolute X values", key="var_abs_x_values")
-            with v2: y = st.selectbox("Radial / Y variable", nums, index=nums.index(bsp) if bsp in nums else min(1,len(nums)-1), key="var_y"); absy = st.checkbox("Use absolute Y values", key="var_abs_y_values")
-            with v3: colour = st.selectbox("Colour", ["None"]+nums, index=(["None"]+nums).index(tws) if tws in nums else 0, key="var_colour"); absc = st.checkbox("Use absolute colour values", key="var_abs_colour_values")
-            with v4: kind = st.radio("Plot type", ["Cartesian","Polar"], key="var_plot_type")
+            with v1:
+                x = st.selectbox("Angular / X variable", nums, index=nums.index(twa) if twa in nums else 0, key="var_x")
+                absx = st.checkbox("Use absolute X values", key="var_abs_x_values")
+            with v2:
+                y = st.selectbox("Radial / Y variable", nums, index=nums.index(bsp) if bsp in nums else min(1,len(nums)-1), key="var_y")
+                absy = st.checkbox("Use absolute Y values", key="var_abs_y_values")
+            with v3:
+                colour = st.selectbox("Colour", ["None"]+nums, index=(["None"]+nums).index(tws) if tws in nums else 0, key="var_colour", disabled=colour_by_event_var)
+                absc = st.checkbox("Use absolute colour values", key="var_abs_colour_values", disabled=colour_by_event_var or colour=="None")
+            with v4:
+                kind = st.radio("Plot type", ["Cartesian","Polar"], key="var_plot_type")
+
             w1,w2,w3,w4 = st.columns(4)
-            with w1: vavg = st.number_input("Variable time average (s)", min_value=1, value=1, step=1, key="var_avg_sec")
-            with w2: x_tol = st.number_input("Max X variation in window", min_value=0.0, value=99.0, step=.5, key="var_x_tol")
-            with w3: y_tol = st.number_input("Max Y variation in window", min_value=0.0, value=99.0, step=.5, key="var_y_tol")
-            with w4: c_tol = st.number_input("Max colour variation in window", min_value=0.0, value=99.0, step=.5, disabled=colour=="None", key="var_colour_tol")
-            avg_columns = [x,y] + ([] if colour=="None" else [colour]) + ([tws] if tws else [])
+            with w1:
+                vavg = st.number_input("Variable time average (s)", min_value=1, value=1, step=1, key="var_avg_sec")
+            with w2:
+                x_tol = st.number_input("Max X variation in window", min_value=0.0, value=99.0, step=.5, key="var_x_tol")
+            with w3:
+                y_tol = st.number_input("Max Y variation in window", min_value=0.0, value=99.0, step=.5, key="var_y_tol")
+            with w4:
+                c_tol = st.number_input("Max colour variation in window", min_value=0.0, value=99.0, step=.5, disabled=colour=="None" or colour_by_event_var, key="var_colour_tol")
+
+            numeric_colour = colour != "None" and not colour_by_event_var
+            avg_columns = [x,y] + ([colour] if numeric_colour else []) + ([tws] if tws else [])
             tolerances = {x:x_tol, y:y_tol}
-            if colour != "None": tolerances[colour] = c_tol
+            if numeric_colour:
+                tolerances[colour] = c_tol
             vd, avg_note = average_with_ranges(filtered, ts, avg_columns, int(vavg), tolerances, signed_twa_col=x if x==twa else None)
-            xn = f"abs({x})" if absx else x; yn = f"abs({y})" if absy else y; cn = f"abs({colour})" if absc and colour!="None" else colour
-            if absx: vd[xn] = vd[x].abs()
-            if absy: vd[yn] = vd[y].abs()
-            if colour != "None" and absc: vd[cn] = vd[colour].abs()
-            cl1,cl2 = st.columns(2); colour_range = None
-            if colour != "None":
+            if colour_by_event_var:
+                vd = add_event_labels(vd, ts, selected_rows)
+            xn = f"abs({x})" if absx else x
+            yn = f"abs({y})" if absy else y
+            cn = f"abs({colour})" if absc and numeric_colour else colour
+            if absx:
+                vd[xn] = vd[x].abs()
+            if absy:
+                vd[yn] = vd[y].abs()
+            if numeric_colour and absc:
+                vd[cn] = vd[colour].abs()
+
+            colour_range = None
+            if numeric_colour:
                 vals = pd.to_numeric(vd[cn], errors="coerce").dropna()
-                if "var_colour_last_field" not in st.session_state or st.session_state["var_colour_last_field"] != cn:
+                if st.session_state.get("var_colour_last_field") != cn:
                     st.session_state["var_colour_last_field"] = cn
                     st.session_state["var_colour_min"] = float(vals.quantile(.02)) if not vals.empty else 0.0
                     st.session_state["var_colour_max"] = float(vals.quantile(.98)) if not vals.empty else 1.0
                 if st.button("Auto scale variable colour to plotted data", key="var_auto_colour_scale"):
                     st.session_state["var_colour_min"] = float(vals.min()) if not vals.empty else 0.0
                     st.session_state["var_colour_max"] = float(vals.max()) if not vals.empty else 1.0
-                if st.session_state.get("var_colour_max", 1.0) <= st.session_state.get("var_colour_min", 0.0):
-                    st.session_state["var_colour_max"] = st.session_state.get("var_colour_min", 0.0) + 0.001
-                with cl1: vmin = st.number_input("Variable colour scale min", key="var_colour_min")
-                with cl2: vmax = st.number_input("Variable colour scale max", key="var_colour_max")
+                if st.session_state.get("var_colour_max",1.0) <= st.session_state.get("var_colour_min",0.0):
+                    st.session_state["var_colour_max"] = st.session_state.get("var_colour_min",0.0) + .001
+                cl1,cl2 = st.columns(2)
+                with cl1:
+                    vmin = st.number_input("Variable colour scale min", key="var_colour_min")
+                with cl2:
+                    vmax = st.number_input("Variable colour scale max", key="var_colour_max")
                 colour_range = (vmin,vmax)
+
             if tws and tws in vd:
                 q1,q2,q3 = st.columns(3)
-                with q1: usebin = st.checkbox("Filter variable plot by TWS bin", key="var_tws_bin_enable")
-                with q2: center = st.number_input("Variable plot TWS centre", value=float(vd[tws].median()), step=.5, disabled=not usebin, key="var_tws_center")
-                with q3: tolerance = st.number_input("Variable plot tolerance ±", min_value=.1, value=1.0, step=.1, disabled=not usebin, key="var_tws_tolerance")
-                if usebin: vd = vd[vd[tws].between(center-tolerance, center+tolerance)]
-            needed = [xn,yn] + ([] if colour=="None" else [cn]); vd = vd.dropna(subset=needed)
-            if performance_mode and len(vd) > max_plot_points: vd = vd.sample(max_plot_points, random_state=42)
-            if kind == "Cartesian": fig = px.scatter(vd, x=xn, y=yn, color=None if colour=="None" else cn, opacity=.62, color_continuous_scale="Turbo", range_color=colour_range)
+                with q1:
+                    usebin = st.checkbox("Filter variable plot by TWS bin", key="var_tws_bin_enable")
+                with q2:
+                    center = st.number_input("Variable plot TWS centre", value=float(vd[tws].median()), step=.5, disabled=not usebin, key="var_tws_center")
+                with q3:
+                    tolerance = st.number_input("Variable plot tolerance ±", min_value=.1, value=1.0, step=.1, disabled=not usebin, key="var_tws_tolerance")
+                if usebin:
+                    vd = vd[vd[tws].between(center-tolerance, center+tolerance)]
+
+            needed = [xn,yn] + ([cn] if numeric_colour else [])
+            vd = vd.dropna(subset=needed)
+            if performance_mode and len(vd) > max_plot_points:
+                vd = vd.sample(max_plot_points, random_state=42)
+
+            # Keep these ranges independent of the selected variable names. They are
+            # initialised once and only change through the controls or Auto scale.
+            def _plot_bounds(series):
+                values = pd.to_numeric(series, errors="coerce").replace([np.inf,-np.inf],np.nan).dropna()
+                if values.empty:
+                    return 0.0, 1.0
+                low, high = float(values.min()), float(values.max())
+                if high <= low:
+                    high = low + 1.0
+                padding = (high-low) * .03
+                return low-padding, high+padding
+            data_xmin,data_xmax = _plot_bounds(vd[xn])
+            data_ymin,data_ymax = _plot_bounds(vd[yn])
+            axis_defaults = {"var_axis_xmin":data_xmin,"var_axis_xmax":data_xmax,"var_axis_ymin":data_ymin,"var_axis_ymax":data_ymax}
+            for key,value in axis_defaults.items():
+                if key not in st.session_state:
+                    st.session_state[key] = float(value)
+            if st.button("Auto scale chart axes to plotted data", key="var_auto_axes"):
+                for key,value in axis_defaults.items():
+                    st.session_state[key] = float(value)
+            ax1,ax2,ax3,ax4 = st.columns(4)
+            with ax1:
+                axis_xmin = st.number_input("X / angular minimum", key="var_axis_xmin")
+            with ax2:
+                axis_xmax = st.number_input("X / angular maximum", key="var_axis_xmax")
+            with ax3:
+                axis_ymin = st.number_input("Y / radial minimum", key="var_axis_ymin")
+            with ax4:
+                axis_ymax = st.number_input("Y / radial maximum", key="var_axis_ymax")
+            if axis_xmax <= axis_xmin:
+                axis_xmax = axis_xmin + .001
+            if axis_ymax <= axis_ymin:
+                axis_ymax = axis_ymin + .001
+
+            if kind == "Cartesian":
+                if colour_by_event_var and "Event" in vd:
+                    fig = px.scatter(vd, x=xn, y=yn, color="Event", opacity=.62)
+                else:
+                    fig = px.scatter(vd, x=xn, y=yn, color=cn if numeric_colour else None, opacity=.62,
+                                     color_continuous_scale="Turbo", range_color=colour_range)
+                fig.update_xaxes(range=[axis_xmin,axis_xmax])
+                fig.update_yaxes(range=[axis_ymin,axis_ymax])
             else:
-                marker = dict(size=6, opacity=.62, color=vd[cn] if colour!="None" else "#00a6a6", colorscale="Turbo", showscale=colour!="None", colorbar=dict(title=cn) if colour!="None" else None)
-                if colour_range: marker.update(cmin=colour_range[0], cmax=colour_range[1])
-                fig = go.Figure(go.Scatterpolar(theta=vd[xn], r=vd[yn], mode="markers", marker=marker, hovertemplate=f"{xn}: %{{theta:.2f}}<br>{yn}: %{{r:.2f}}<extra></extra>")); fig.update_layout(polar=dict(angularaxis=dict(direction="clockwise", rotation=90)))
-            fig.update_layout(template="plotly_dark", height=635, title=f"{yn} against {xn} ({avg_note})"); st.plotly_chart(fig, width="stretch"); st.caption(f"Displaying {len(vd):,} records")
+                fig = go.Figure()
+                if colour_by_event_var and "Event" in vd:
+                    palette = px.colors.qualitative.Plotly
+                    for colour_index,(event_name,event_data) in enumerate(vd.groupby("Event", observed=True, sort=False)):
+                        fig.add_trace(go.Scatterpolar(theta=event_data[xn], r=event_data[yn], mode="markers", name=str(event_name),
+                                                      marker=dict(size=6, opacity=.62, color=palette[colour_index % len(palette)])))
+                else:
+                    marker = dict(size=6, opacity=.62, color=vd[cn] if numeric_colour else "#00a6a6",
+                                  colorscale="Turbo", showscale=numeric_colour,
+                                  colorbar=dict(title=cn) if numeric_colour else None)
+                    if colour_range:
+                        marker.update(cmin=colour_range[0], cmax=colour_range[1])
+                    fig.add_trace(go.Scatterpolar(theta=vd[xn], r=vd[yn], mode="markers", marker=marker,
+                                                  hovertemplate=f"{xn}: %{{theta:.2f}}<br>{yn}: %{{r:.2f}}<extra></extra>"))
+                fig.update_layout(polar=dict(sector=[axis_xmin,axis_xmax],
+                                             angularaxis=dict(direction="clockwise", rotation=90),
+                                             radialaxis=dict(range=[axis_ymin,axis_ymax])))
+            fig.update_layout(template="plotly_dark", height=635, title=f"{yn} against {xn} ({avg_note})", uirevision="nightjar-variable-axes")
+            st.plotly_chart(fig, width="stretch")
+            st.caption(f"Displaying {len(vd):,} records")
+
     if active_page == "Files and sail chart":
         if src["sail_chart"]:
             try: sails = load_sails_fast(src["sail_chart"]); st.plotly_chart(sail_fig(sails), width="stretch"); st.dataframe(round_numeric_df(sails), width="stretch", height=270)
@@ -1407,11 +1586,11 @@ def main():
         download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
         filtered_mb = dataframe_memory_mb(filtered)
         if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.8.1.csv", "text/csv", key="download_filtered")
+            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.9.csv", "text/csv", key="download_filtered")
         else:
             st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.8.1.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.9.json", "application/json", key="download_session")
     # Refresh after the active page has been built so the sidebar reports the
     # process resident set, including the current plot's temporary objects.
     gc.collect()
