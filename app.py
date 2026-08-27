@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.7"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.8"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -1068,10 +1068,13 @@ def main():
     if st.sidebar.button("Sign out", key="nightjar_sign_out"):
         st.session_state["nightjar_authenticated"] = False
         st.rerun()
+    st.sidebar.markdown("<style>[data-testid="stMetric"]{background:rgba(242,140,40,.12);border:1px solid #f28c28;border-radius:8px;padding:0.25rem 0.5rem;}[data-testid="stMetricLabel"]{font-size:0.75rem;}[data-testid="stMetricValue"]{font-size:1rem;color:#f28c28;}</style>", unsafe_allow_html=True)
     memory_placeholder = st.sidebar.empty()
     memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
     logo = DATA_DIR / DEFAULT_FILES["logo"]
     if logo.exists(): st.sidebar.image(str(logo), width="stretch")
+    st.sidebar.header("Event filter")
+    st.sidebar.caption("Filters are applied before file processing and plotting.")
     st.sidebar.header("Input files")
     defs = [("log","Expedition log",["csv","txt"]),("polar","Target polar",["txt","csv","pol"]),("events","Expedition events",["csv","txt"]),("event_list","Event list",["txt","csv"]),("tests","Expedition tests",["csv"]),("sail_chart","Sail selection chart",["xml"]),("debrief","Debrief notes",["txt","md","docx"])]
     ups = {k: st.sidebar.file_uploader(n, type=t, key=f"file_{k}") for k,n,t in defs}; src = {k: (v if k == "debrief" else local(v,k)) for k,v in ups.items()}
@@ -1110,6 +1113,7 @@ def main():
             st.sidebar.subheader("Event, date and time filter")
             with st.sidebar.form("nightjar_filter_form"):
                 performance_mode = st.checkbox("Performance mode", value=True, key="perf_mode")
+                st.caption("Performance mode limits figures to approximately 10,000 plotted points per chart to reduce browser and server memory usage.")
                 max_plot_points = st.number_input("Maximum plotted points", min_value=1000, max_value=50000, value=10000, step=1000, key="max_plot_points")
                 filtered_event_list = event_list.copy()
                 if not filtered_event_list.empty and "type" in filtered_event_list.columns:
@@ -1157,6 +1161,7 @@ def main():
     # A single active page is executed per rerun. Streamlit tabs execute every tab,
     # including hidden plotting code, which was the main source of temporary RAM growth.
     page_names = ["Overview","Event summary","Polar analysis","GPS track","Variable plot","Files and sail chart"]
+    st.markdown("""<style>div[role="radiogroup"] label{padding:10px 18px;border:1px solid #f28c28;border-radius:8px;background:rgba(242,140,40,0.12);margin-right:6px;cursor:pointer;} div[role="radiogroup"] label:hover{background:rgba(242,140,40,0.2);} </style>""", unsafe_allow_html=True)
     active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
     previous_page = st.session_state.get("nightjar_previous_page")
     if previous_page != active_page:
@@ -1396,11 +1401,11 @@ def main():
         download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
         filtered_mb = dataframe_memory_mb(filtered)
         if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.7.csv", "text/csv", key="download_filtered")
+            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.8.csv", "text/csv", key="download_filtered")
         else:
             st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.7.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.8.json", "application/json", key="download_session")
     # Refresh after the active page has been built so the sidebar reports the
     # process resident set, including the current plot's temporary objects.
     gc.collect()
