@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.5"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.6"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -163,7 +163,7 @@ def local_cache_path_for(path):
     p = Path(path)
     stat = p.stat()
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.stem)
-    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_074c.parquet")
+    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_076.parquet")
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -277,87 +277,253 @@ def excel_dt(s):
     return pd.to_datetime(s,errors="coerce",dayfirst=True)
 
 
-def parse_sparse(text):
-    lines = [x for x in text.splitlines() if x.strip()]
-    names = next(csv.reader([lines[0]])); ids = next(csv.reader([lines[1]]))
-    lookup = {i.strip(): n.lstrip("!").strip() for n, i in zip(names, ids) if i.strip().lstrip("-").isdigit()}
-    rec = []
-    for line in lines[3:]:
-        f = next(csv.reader([line]))
-        if len(f) < 2: continue
-        row = {"Boat": f[0], "Utc": f[1]}
-        for i in range(2, len(f)-1, 2):
-            if f[i].strip() in lookup: row[lookup[f[i].strip()]] = f[i+1].strip()
-        rec.append(row)
-    df = pd.DataFrame(rec)
+def _process_log_chunk(df):
+    """Normalise one bounded log chunk without retaining parser temporaries."""
+    if df is None or df.empty:
+        return pd.DataFrame()
     if "Boat" in df.columns:
-        df = df[df["Boat"].astype(str).str.strip().eq("0")].copy()
-    df["Utc"] = excel_dt(df["Utc"])
-    for c in df.columns:
-        if c not in ("Boat", "Utc"):
-            x = pd.to_numeric(df[c], errors="coerce")
-            if x.notna().sum() >= max(1, int(.6 * df[c].notna().sum())): df[c] = x
-    return ensure_vmg(df.sort_values("Utc").reset_index(drop=True))
+        boat = df["Boat"].astype(str).str.strip().eq("0")
+        if not boat.all():
+            df = df.loc[boat].copy()
+        del boat
+    if df.empty:
+        return df
+    mapping = detect_columns(df)
+    timestamp = mapping.get("timestamp")
+    if timestamp:
+        df[timestamp] = excel_dt(df[timestamp])
+    for column in list(df.columns):
+        dtype = df[column].dtype
+        if column == timestamp or not (
+            pd.api.types.is_object_dtype(dtype)
+            or pd.api.types.is_string_dtype(dtype)
+        ):
+            continue
+        sample = df[column].dropna().head(500)
+        numeric_sample = pd.to_numeric(sample, errors="coerce").to_numpy(
+            dtype=float, na_value=np.nan
+        )
+        if not sample.empty and np.isfinite(numeric_sample).mean() >= 0.8:
+            df[column] = pd.to_numeric(df[column], errors="coerce", downcast="float")
+    optimise_dtypes(df)
+    ensure_vmg(df)
+    df.index = pd.RangeIndex(len(df))
+    return df
 
-def _source_prefix(src,size=65536):
-    if isinstance(src,(str,Path)):
-        with Path(src).open("rb") as handle: return handle.read(size)
-    try: position=src.tell()
-    except Exception: position=0
-    try: src.seek(0); prefix=src.read(size)
+
+def _rss_mb():
+    """Return current resident memory on Linux, without requiring psutil."""
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        return pages * page_size / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
+
+
+class _BoundedLogCollector:
+    """Collect sequential chunks and thin uniformly before RAM becomes unsafe.
+
+    The app's interactive views require a pandas DataFrame. When the complete
+    log cannot safely fit, retained records are deterministically decimated
+    across the whole timeline. This preserves date/time coverage while keeping
+    the resident process below the configured Railway memory ceiling.
+    """
+    def __init__(self):
+        self.limit_mb = float(os.environ.get("NIGHTJAR_MEMORY_LIMIT_MB", "750"))
+        self.frame_budget_mb = float(os.environ.get("NIGHTJAR_LOG_FRAME_BUDGET_MB", "140"))
+        self.headroom_mb = float(os.environ.get("NIGHTJAR_MEMORY_HEADROOM_MB", "180"))
+        self.chunks = []
+        self.input_rows = 0
+        self.stride = 1
+
+    def _stored_mb(self):
+        return sum(dataframe_memory_mb(c) for c in self.chunks)
+
+    def _thin_once(self):
+        thinned = []
+        for chunk in self.chunks:
+            if not chunk.empty:
+                smaller = chunk.iloc[::2].copy()
+                optimise_dtypes(smaller)
+                thinned.append(smaller)
+            del chunk
+        self.chunks = thinned
+        self.stride *= 2
+        gc.collect()
+
+    def add(self, chunk):
+        if chunk is None or chunk.empty:
+            return
+        chunk = _process_log_chunk(chunk)
+        source_rows = len(chunk)
+        if not source_rows:
+            return
+        start_row = self.input_rows
+        self.input_rows += source_rows
+        # Select against a global row number so chunk boundaries do not bias
+        # the retained timeline.
+        offset = (-start_row) % self.stride
+        kept = chunk.iloc[offset::self.stride].copy()
+        del chunk
+        if not kept.empty:
+            optimise_dtypes(kept)
+            self.chunks.append(kept)
+        while self.chunks and (
+            self._stored_mb() > self.frame_budget_mb
+            or (_rss_mb() and _rss_mb() > self.limit_mb - self.headroom_mb)
+        ):
+            self._thin_once()
+
+    def finish(self):
+        if not self.chunks:
+            raise ValueError("The log file is empty")
+        # Leave room for concat to allocate its output alongside the chunks.
+        while self._stored_mb() > self.frame_budget_mb * 0.72:
+            self._thin_once()
+        df = pd.concat(self.chunks, ignore_index=True, sort=False, copy=False)
+        self.chunks.clear()
+        optimise_dtypes(df)
+        mapping = detect_columns(df)
+        timestamp = mapping.get("timestamp")
+        if timestamp and not df[timestamp].is_monotonic_increasing:
+            df.sort_values(timestamp, inplace=True, kind="stable", ignore_index=True)
+        ensure_vmg(df)
+        df.attrs["nightjar_source_rows"] = int(self.input_rows)
+        df.attrs["nightjar_retained_rows"] = int(len(df))
+        df.attrs["nightjar_sampling_stride"] = int(self.stride)
+        df.attrs["nightjar_memory_budget_mb"] = float(self.frame_budget_mb)
+        gc.collect()
+        return df
+
+
+def _text_stream(src):
+    """Open a text CSV stream and report whether this function must close it."""
+    if isinstance(src, (str, Path)):
+        return Path(src).open("r", encoding="utf-8-sig", errors="replace", newline=""), True
+    try:
+        src.seek(0)
+    except Exception:
+        pass
+    if isinstance(src, io.TextIOBase):
+        return src, False
+    return io.TextIOWrapper(src, encoding="utf-8-sig", errors="replace", newline=""), False
+
+
+def parse_sparse_stream(src, chunk_rows=None):
+    """Parse a multi-section sparse Expedition log one bounded block at a time."""
+    chunk_rows = max(5000, int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "25000")))
+    collector = _BoundedLogCollector()
+    handle, close_handle = _text_stream(src)
+    reader = csv.reader(handle)
+    names = None
+    lookup = {}
+    records = []
+    try:
+        for fields in reader:
+            if not fields or not any(str(v).strip() for v in fields):
+                continue
+            first = fields[0].strip().casefold()
+            second = fields[1].strip() if len(fields) > 1 else ""
+            if first == "!boat" and second.casefold() == "utc":
+                names = fields
+                lookup = {}
+                continue
+            if first == "!boat" and second.lstrip("+-").isdigit():
+                if names and len(names) == len(fields):
+                    lookup = {
+                        channel_id.strip(): name.lstrip("!").strip()
+                        for name, channel_id in zip(names, fields)
+                        if channel_id.strip().lstrip("+-").isdigit()
+                    }
+                continue
+            if fields[0].lstrip().startswith("!") or len(fields) < 2:
+                continue
+            row = {"Boat": fields[0], "Utc": fields[1]}
+            for pos in range(2, len(fields) - 1, 2):
+                channel = lookup.get(fields[pos].strip())
+                if channel:
+                    row[channel] = fields[pos + 1].strip()
+            records.append(row)
+            if len(records) >= chunk_rows:
+                collector.add(pd.DataFrame.from_records(records))
+                records.clear()
+        if records:
+            collector.add(pd.DataFrame.from_records(records))
+            records.clear()
     finally:
-        try: src.seek(position)
-        except Exception: pass
-    return prefix.encode("utf-8",errors="replace") if isinstance(prefix,str) else prefix
+        if close_handle:
+            handle.close()
+        elif isinstance(handle, io.TextIOWrapper):
+            # Keep an uploaded binary object open for Streamlit reruns.
+            try:
+                handle.detach()
+            except Exception:
+                pass
+    return collector.finish()
+
+
+def _source_prefix(src, size=65536):
+    if isinstance(src, (str, Path)):
+        with Path(src).open("rb") as handle:
+            return handle.read(size)
+    try:
+        position = src.tell()
+    except Exception:
+        position = 0
+    try:
+        src.seek(0)
+        prefix = src.read(size)
+    finally:
+        try:
+            src.seek(position)
+        except Exception:
+            pass
+    return prefix.encode("utf-8", errors="replace") if isinstance(prefix, str) else prefix
 
 
 def _is_sparse_log(src):
-    prefix=_source_prefix(src)
-    for encoding in ("utf-8-sig","cp1252","latin-1"):
-        try: preview=prefix.decode(encoding); break
-        except UnicodeDecodeError: continue
-    lines=[line for line in preview.splitlines() if line.strip()][:2]
-    return len(lines)==2 and lines[0].startswith("!") and lines[1].lower().startswith("!boat")
+    prefix = _source_prefix(src)
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            preview = prefix.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    lines = [line for line in preview.splitlines() if line.strip()][:2]
+    return len(lines) == 2 and lines[0].startswith("!") and lines[1].lower().startswith("!boat")
 
 
-def _read_csv_low_memory(src):
-    kwargs=dict(low_memory=True,on_bad_lines="warn")
-    if isinstance(src,(str,Path)): kwargs["memory_map"]=True
-    try: return pd.read_csv(src,dtype_backend="pyarrow",**kwargs)
-    except (TypeError,ImportError,ValueError):
-        try: src.seek(0)
-        except Exception: pass
-        return pd.read_csv(src,**kwargs)
+def parse_standard_stream(src, chunk_rows=None):
+    """Read a conventional CSV sequentially and retain a RAM-bounded frame."""
+    chunk_rows = max(5000, int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "25000")))
+    collector = _BoundedLogCollector()
+    kwargs = dict(chunksize=chunk_rows, low_memory=True, on_bad_lines="warn")
+    if isinstance(src, (str, Path)):
+        kwargs["memory_map"] = True
+    try:
+        iterator = pd.read_csv(src, dtype_backend="pyarrow", **kwargs)
+    except (TypeError, ImportError, ValueError):
+        try:
+            src.seek(0)
+        except Exception:
+            pass
+        iterator = pd.read_csv(src, **kwargs)
+    for chunk in iterator:
+        collector.add(chunk)
+    return collector.finish()
 
 
 def parse_log(src):
-    # Standard CSV never becomes an all-file bytes object, decoded string,
-    # split-lines list and StringIO simultaneously.
-    if _is_sparse_log(src): return parse_sparse(decode(src))
+    """Sequential, memory-bounded log loader used by Nightjar 0.7.6."""
+    if _is_sparse_log(src):
+        return parse_sparse_stream(src)
     try:
-        if not isinstance(src,(str,Path)): src.seek(0)
-    except Exception: pass
-    df=_read_csv_low_memory(src)
-    if df.empty: raise ValueError("The log file is empty")
-    if "Boat" in df.columns:
-        mask=df["Boat"].astype(str).str.strip().eq("0").to_numpy()
-        if not mask.all(): df=df.loc[mask]; df.index=pd.RangeIndex(len(df))
-        del mask
-    mapping=detect_columns(df); timestamp=mapping.get("timestamp")
-    if timestamp:
-        df[timestamp]=excel_dt(df[timestamp])
-        if not df[timestamp].is_monotonic_increasing:
-            df.sort_values(timestamp,inplace=True,kind="stable",ignore_index=True)
-    for column in list(df.columns):
-        dtype=df[column].dtype
-        if column==timestamp or not (pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype)): continue
-        sample=df[column].dropna().head(500)
-        numeric_sample=pd.to_numeric(sample,errors="coerce").to_numpy(dtype=float,na_value=np.nan)
-        if not sample.empty and np.isfinite(numeric_sample).mean() >= 0.8:
-            df[column]=pd.to_numeric(df[column],errors="coerce",downcast="float")
-    optimise_dtypes(df); ensure_vmg(df)
-    if not isinstance(df.index,pd.RangeIndex): df.index=pd.RangeIndex(len(df))
-    gc.collect(); return df
+        if not isinstance(src, (str, Path)):
+            src.seek(0)
+    except Exception:
+        pass
+    return parse_standard_stream(src)
 
 
 @dataclass
@@ -883,9 +1049,21 @@ def main():
     st.sidebar.header("Input files")
     defs = [("log","Expedition log",["csv","txt"]),("polar","Target polar",["txt","csv","pol"]),("events","Expedition events",["csv","txt"]),("event_list","Event list",["txt","csv"]),("tests","Expedition tests",["csv"]),("sail_chart","Sail selection chart",["xml"]),("debrief","Debrief notes",["txt","md","docx"])]
     ups = {k: st.sidebar.file_uploader(n, type=t, key=f"file_{k}") for k,n,t in defs}; src = {k: (v if k == "debrief" else local(v,k)) for k,v in ups.items()}
-    if not src["log"]: st.info("Upload a log or place the reference files in the data folder beside app_0.7.4.py"); st.stop()
+    if not src["log"]: st.info("Upload a log or place the reference files in the data folder in the /Data volume"); st.stop()
     try: df = load_log_fast(src["log"])
     except Exception as e: st.error(f"Could not read log: {e}"); st.stop()
+    source_rows = int(df.attrs.get("nightjar_source_rows", len(df)))
+    sampling_stride = int(df.attrs.get("nightjar_sampling_stride", 1))
+    if sampling_stride > 1:
+        st.warning(
+            f"Memory-safe sequential loading retained {len(df):,} of "
+            f"{source_rows:,} data rows (approximately every {sampling_stride:,}th row). "
+            "Date/time coverage is preserved, but summaries use the retained sample."
+        )
+    st.sidebar.caption(
+        f"Log RAM: {dataframe_memory_mb(df):.0f} MiB · "
+        f"rows retained: {len(df):,}/{source_rows:,} · stride: {sampling_stride:,}"
+    )
     events = load_events_fast(src["events"])
     event_list = load_event_list_fast(src["event_list"])
     polar = load_polar_fast(src["polar"])
@@ -1170,9 +1348,9 @@ def main():
         download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
         filtered_mb = dataframe_memory_mb(filtered)
         if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.4c.csv", "text/csv", key="download_filtered")
+            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.6.csv", "text/csv", key="download_filtered")
         else:
             st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.4c.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.6.json", "application/json", key="download_session")
 if __name__ == "__main__": main()
