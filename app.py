@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.7.10.6"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.8.0"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -134,17 +134,38 @@ def dataframe_memory_mb(df):
     return float(df.memory_usage(index=True, deep=True).sum()) / (1024.0 * 1024.0)
 
 
-def optimise_dtypes(df):
-    """Reduce memory in place; do not duplicate the full log."""
-    if df is None or df.empty: return df
+def optimise_dtypes(df, categorise_text=False):
+    """Reduce memory in place without duplicating the complete log.
+
+    Numeric columns are always downcast. Low-cardinality text is categorised only
+    for a completed frame: doing this independently in parser chunks can force
+    pandas to expand incompatible categories again during concatenation.
+    """
+    if df is None or df.empty:
+        return df
     for c in list(df.select_dtypes(include=["float64"]).columns):
         df[c] = pd.to_numeric(df[c], downcast="float")
     for c in list(df.select_dtypes(include=["int64", "int32"]).columns):
         df[c] = pd.to_numeric(df[c], downcast="integer")
-    for c in ("Boat", "Sail"):
-        if c in df.columns:
-            try: df[c] = df[c].astype("category")
-            except Exception: pass
+    if categorise_text:
+        for c in list(df.select_dtypes(include=["object", "string"]).columns):
+            non_null = df[c].dropna()
+            if non_null.empty:
+                continue
+            unique_count = int(non_null.nunique(dropna=True))
+            threshold = min(1000, max(20, len(non_null) // 20))
+            if unique_count <= threshold:
+                try:
+                    df[c] = df[c].astype("category")
+                except (TypeError, ValueError):
+                    pass
+    else:
+        for c in ("Boat", "Sail"):
+            if c in df.columns:
+                try:
+                    df[c] = df[c].astype("category")
+                except (TypeError, ValueError):
+                    pass
     return df
 
 
@@ -163,19 +184,19 @@ def local_cache_path_for(path):
     p = Path(path)
     stat = p.stat()
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.stem)
-    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_079.parquet")
+    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_080.parquet")
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=2)
 def parse_events_cached(raw): return parse_events(io.BytesIO(raw))
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=2)
 def parse_event_list_cached(raw): return parse_event_list(io.BytesIO(raw))
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=2)
 def parse_polar_cached(raw): return parse_polar(io.BytesIO(raw))
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=2)
 def parse_sails_cached(raw): return parse_sails(io.BytesIO(raw))
 
 
@@ -184,7 +205,7 @@ def load_local_log_resource(path_string, file_size, modified_ns):
     """Hold one shared local log between reruns, without cache_data copies."""
     p = Path(path_string); cache = local_cache_path_for(p)
     if cache.exists() and cache.stat().st_mtime_ns >= modified_ns:
-        try: return optimise_dtypes(pd.read_parquet(cache))
+        try: return optimise_dtypes(pd.read_parquet(cache), categorise_text=True)
         except Exception: pass
     df = optimise_dtypes(parse_log(p))
     # Arrow conversion can spike RAM, so only write modest caches by default.
@@ -383,7 +404,12 @@ class _BoundedLogCollector:
             self._thin_once()
         df = pd.concat(self.chunks, ignore_index=True, sort=False, copy=False)
         self.chunks.clear()
-        optimise_dtypes(df)
+        # Categories are chosen once from the completed frame so parser chunks
+        # never carry incompatible categorical dictionaries.
+        optimise_dtypes(df, categorise_text=True)
+        all_null = [c for c in df.columns if df[c].isna().all()]
+        if all_null:
+            df.drop(columns=all_null, inplace=True)
         mapping = detect_columns(df)
         timestamp = mapping.get("timestamp")
         if timestamp and not df[timestamp].is_monotonic_increasing:
@@ -411,14 +437,31 @@ def _text_stream(src):
 
 
 def parse_sparse_stream(src, chunk_rows=None):
-    """Parse a multi-section sparse Expedition log one bounded block at a time."""
-    chunk_rows = max(5000, int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "25000")))
+    """Parse sparse Expedition logs in bounded, column-oriented blocks.
+
+    Column lists avoid retaining thousands of per-row Python dictionaries. New
+    channels can still appear in later sparse sections; missing values are padded
+    only inside the current bounded block.
+    """
+    chunk_rows = max(
+        5000,
+        int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "12000")),
+    )
     collector = _BoundedLogCollector()
     handle, close_handle = _text_stream(src)
     reader = csv.reader(handle)
     names = None
     lookup = {}
-    records = []
+    columns = {"Boat": [], "Utc": []}
+    buffered_rows = 0
+
+    def flush():
+        nonlocal columns, buffered_rows
+        if buffered_rows:
+            collector.add(pd.DataFrame(columns))
+        columns = {"Boat": [], "Utc": []}
+        buffered_rows = 0
+
     try:
         for fields in reader:
             if not fields or not any(str(v).strip() for v in fields):
@@ -439,23 +482,28 @@ def parse_sparse_stream(src, chunk_rows=None):
                 continue
             if fields[0].lstrip().startswith("!") or len(fields) < 2:
                 continue
-            row = {"Boat": fields[0], "Utc": fields[1]}
+
+            # Append one missing slot to each known channel, then fill only the
+            # sparse values present in this record.
+            for values in columns.values():
+                values.append(None)
+            columns["Boat"][-1] = fields[0]
+            columns["Utc"][-1] = fields[1]
             for pos in range(2, len(fields) - 1, 2):
                 channel = lookup.get(fields[pos].strip())
-                if channel:
-                    row[channel] = fields[pos + 1].strip()
-            records.append(row)
-            if len(records) >= chunk_rows:
-                collector.add(pd.DataFrame.from_records(records))
-                records.clear()
-        if records:
-            collector.add(pd.DataFrame.from_records(records))
-            records.clear()
+                if not channel:
+                    continue
+                if channel not in columns:
+                    columns[channel] = [None] * (buffered_rows + 1)
+                columns[channel][-1] = fields[pos + 1].strip()
+            buffered_rows += 1
+            if buffered_rows >= chunk_rows:
+                flush()
+        flush()
     finally:
         if close_handle:
             handle.close()
         elif isinstance(handle, io.TextIOWrapper):
-            # Keep an uploaded binary object open for Streamlit reruns.
             try:
                 handle.detach()
             except Exception:
@@ -496,7 +544,7 @@ def _is_sparse_log(src):
 
 def parse_standard_stream(src, chunk_rows=None):
     """Read a conventional CSV sequentially and retain a RAM-bounded frame."""
-    chunk_rows = max(5000, int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "25000")))
+    chunk_rows = max(5000, int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "12000")))
     collector = _BoundedLogCollector()
     kwargs = dict(chunksize=chunk_rows, low_memory=True, on_bad_lines="warn")
     if isinstance(src, (str, Path)):
@@ -515,7 +563,7 @@ def parse_standard_stream(src, chunk_rows=None):
 
 
 def parse_log(src):
-    """Sequential, memory-bounded log loader used by Nightjar 0.7.9."""
+    """Sequential, memory-bounded log loader used by Nightjar 0.8.0."""
     if _is_sparse_log(src):
         return parse_sparse_stream(src)
     try:
@@ -706,15 +754,106 @@ def signed_twa(s):
         return pd.Series(signed, index=s.index, name=s.name, dtype=np.float32)
     return signed
 
+def add_tack_labels(data, twa_col):
+    """Add compact tack labels; positive signed TWA is Starboard, negative is Port."""
+    if data is None or data.empty or not twa_col or twa_col not in data.columns:
+        return data
+    out = data.copy(deep=False)
+    angles = signed_twa(out[twa_col]).to_numpy(dtype=np.float32, copy=False)
+    labels = np.full(len(out), "Unknown", dtype=object)
+    labels[np.isfinite(angles) & (angles < 0)] = "Port"
+    labels[np.isfinite(angles) & (angles > 0)] = "Starboard"
+    out["Tack"] = pd.Categorical(
+        labels, categories=["Port", "Starboard", "Unknown"], ordered=False
+    )
+    return out
+
+
+def select_filtered_rows(df, positions, columns=None):
+    """Select filtered positions after projecting columns to avoid a full-width copy."""
+    if columns is None:
+        base = df
+    else:
+        wanted = []
+        for c in columns:
+            if c and c in df.columns and c not in wanted:
+                wanted.append(c)
+        base = df.loc[:, wanted]
+    if positions is None:
+        return base
+    positions = np.asarray(positions, dtype=np.int64)
+    if not len(positions):
+        return base.iloc[0:0]
+    # A contiguous range can remain a cheap slice; disjoint event selections copy
+    # only the projected page columns rather than every channel in the master log.
+    if positions[-1] - positions[0] + 1 == len(positions):
+        return base.iloc[int(positions[0]): int(positions[-1]) + 1]
+    return base.iloc[positions]
+
+
+def normalised_days(values):
+    """Compact datetime64 day values; never create Python date objects per row."""
+    if pd.api.types.is_datetime64_any_dtype(values):
+        return values.dt.normalize()
+    return pd.to_datetime(values, errors="coerce").dt.normalize()
+
+
+def seconds_since_midnight(values):
+    """Return compact integer seconds for time-of-day filtering."""
+    return (
+        values.dt.hour.to_numpy(dtype=np.int32) * 3600
+        + values.dt.minute.to_numpy(dtype=np.int32) * 60
+        + values.dt.second.to_numpy(dtype=np.int32)
+    )
+
+
+def compact_hover_payload(data, ts_col, numeric_columns):
+    """Build Plotly hover arrays without allocating one formatted string per row."""
+    numeric_columns = [c for c in numeric_columns if c and c in data.columns]
+    if numeric_columns:
+        customdata = data[numeric_columns].to_numpy(dtype=np.float32, copy=True)
+    else:
+        customdata = np.empty((len(data), 0), dtype=np.float32)
+    lines = []
+    text = None
+    if ts_col and ts_col in data.columns:
+        text = data[ts_col]
+        lines.append("Time: %{text}")
+    lines.extend(
+        f"{column}: %{{customdata[{index}]:.4g}}"
+        for index, column in enumerate(numeric_columns)
+    )
+    return text, customdata, "<br>".join(lines) + "<extra></extra>"
+
+
+def colour_group_controls(prefix, multi_event, twa_available):
+    """Render event/tack colour selectors and return the active category column."""
+    c1, c2 = st.columns(2)
+    with c1:
+        by_event = st.toggle(
+            "Colour by event", value=False, key=f"{prefix}_colour_by_event",
+            disabled=not multi_event,
+        ) if multi_event else False
+    with c2:
+        by_tack = st.toggle(
+            "Colour by tack", value=False, key=f"{prefix}_colour_by_tack",
+            disabled=not twa_available,
+            help="Positive signed TWA is Starboard; negative signed TWA is Port.",
+        )
+    if by_event and by_tack:
+        st.caption("Colour by tack is active; turn it off to colour by event.")
+    return "Tack" if by_tack else ("Event" if by_event else None)
+
+
 def point_filter(df, twa_col, selection):
     if not twa_col or selection == "All": return df
     a = signed_twa(df[twa_col]).abs(); return df[a <= 90] if selection.startswith("Upwind") else df[a > 90]
 
 def average_with_ranges(df, ts, columns, seconds, tolerances=None, signed_twa_col=None):
-    """Return only requested channels, using one compact grouped aggregation.
+    """Return requested channels while bounding aggregation temporaries.
 
-    The raw path is also column-limited. This prevents plotting pages from retaining
-    a shallow view of every channel in a wide log.
+    Means are calculated for output channels. Min/max arrays are created only for
+    channels that have an active range tolerance, rather than for every channel.
     """
     tolerances = tolerances or {}
     clean_columns = []
@@ -724,7 +863,12 @@ def average_with_ranges(df, ts, columns, seconds, tolerances=None, signed_twa_co
     raw_columns = ([ts] if ts and ts in df.columns else []) + clean_columns
     if not raw_columns:
         return df.iloc[:, 0:0].copy(deep=False), "raw"
-    if seconds <= 1 or not ts or ts not in df or not pd.api.types.is_datetime64_any_dtype(df[ts]):
+    if (
+        seconds <= 1
+        or not ts
+        or ts not in df
+        or not pd.api.types.is_datetime64_any_dtype(df[ts])
+    ):
         return df.loc[:, raw_columns].copy(deep=False), "raw"
 
     valid_time = df[ts].notna()
@@ -739,18 +883,26 @@ def average_with_ranges(df, ts, columns, seconds, tolerances=None, signed_twa_co
     if not d[ts].is_monotonic_increasing:
         d.sort_values(ts, inplace=True, kind="stable")
 
-    grouped = d.set_index(ts)[clean_columns].resample(f"{int(seconds)}s").agg(["mean", "min", "max"])
-    means = grouped.xs("mean", axis=1, level=1)
-    minima = grouped.xs("min", axis=1, level=1)
-    maxima = grouped.xs("max", axis=1, level=1)
+    rule = f"{int(seconds)}s"
+    indexed = d.set_index(ts)
+    means = indexed[clean_columns].resample(rule).mean()
     keep = np.ones(len(means), dtype=bool)
-    for col, tol in tolerances.items():
-        if col in means.columns and tol is not None:
-            span = (maxima[col] - minima[col]).to_numpy(dtype=np.float32, na_value=np.nan)
-            keep &= np.isfinite(span) & (span <= float(tol))
+    tolerance_columns = [
+        col for col, tol in tolerances.items()
+        if col in clean_columns and tol is not None
+    ]
+    if tolerance_columns:
+        limits = indexed[tolerance_columns].resample(rule).agg(["min", "max"])
+        for col in tolerance_columns:
+            span = (
+                limits[(col, "max")] - limits[(col, "min")]
+            ).to_numpy(dtype=np.float32, na_value=np.nan)
+            keep &= np.isfinite(span) & (span <= float(tolerances[col]))
+        del limits
+
     out = means.iloc[np.flatnonzero(keep)].dropna(how="all").reset_index()
     optimise_dtypes(out)
-    del d, grouped, means, minima, maxima, keep
+    del d, indexed, means, keep
     gc.collect()
     return out, f"{seconds}s average"
 
@@ -807,7 +959,7 @@ def half_polar_sailing_plot(df, m, polar, target, y_range=None):
         d["_vmg_hover"] = pd.to_numeric(d[vmg], errors="coerce") if vmg and vmg in d else d["_r"] * np.cos(np.deg2rad(d["_theta"]))
         d["_tws_hover"] = pd.to_numeric(d[tws], errors="coerce") if tws and tws in d else np.nan
         marker = dict(size=5, opacity=.65, color=d[tws] if tws in d else "#00a6a6", colorscale="Turbo", showscale=tws in d, colorbar=dict(title="TWS kt") if tws in d else None)
-        fig.add_trace(go.Scatter(x=d["_x"], y=d["_y"], mode="markers", name="Actual", marker=marker, customdata=np.column_stack([d["_theta"], d["_r"], d["_vmg_hover"], d["_tws_hover"]]), hovertemplate="TWA: %{customdata[0]:.1f}°<br>BSP: %{customdata[1]:.2f} kt<br>VMG: %{customdata[2]:.2f} kt<br>TWS: %{customdata[3]:.2f} kt<extra></extra>"))
+        fig.add_trace(go.Scatter(x=d["_x"], y=d["_y"], mode="markers", name="Actual", marker=marker, customdata=np.column_stack([d["_theta"], d["_r"], d["_vmg_hover"], d["_tws_hover"]]), hovertemplate="TWA: %{customdata[0]:.4g}°<br>BSP: %{customdata[1]:.4g} kt<br>VMG: %{customdata[2]:.4g} kt<br>TWS: %{customdata[3]:.4g} kt<extra></extra>"))
 
     if polar and target is not None:
         w = min(polar.tws, key=lambda x: abs(x-target))
@@ -817,28 +969,30 @@ def half_polar_sailing_plot(df, m, polar, target, y_range=None):
         y = c["Target BSP"] * np.cos(np.deg2rad(c["TWA"]))
         c["Target VMG"] = c["Target BSP"] * np.cos(np.deg2rad(c["TWA"]))
         c["Target TWS"] = float(w)
-        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"Target {w:g} kt", line=dict(color="#f28c28", width=4), hovertemplate="TWA: %{customdata[0]:.1f}°<br>Target BSP: %{customdata[1]:.2f} kt<br>Target VMG: %{customdata[2]:.2f} kt<br>TWS: %{customdata[3]:.2f} kt<extra></extra>", customdata=np.column_stack([c["TWA"], c["Target BSP"], c["Target VMG"], c["Target TWS"]])))
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"Target {w:g} kt", line=dict(color="#f28c28", width=4), hovertemplate="TWA: %{customdata[0]:.4g}°<br>Target BSP: %{customdata[1]:.4g} kt<br>Target VMG: %{customdata[2]:.4g} kt<br>TWS: %{customdata[3]:.4g} kt<extra></extra>", customdata=np.column_stack([c["TWA"], c["Target BSP"], c["Target VMG"], c["Target TWS"]])))
 
     fig.update_layout(template="plotly_dark", height=690, title="Actual boat speed and target polar - half polar", xaxis=dict(title="", visible=False, range=[-0.08*r_max, 1.12*r_max], scaleanchor="y", scaleratio=1), yaxis=dict(title="", visible=False, range=[-1.12*r_max, 1.12*r_max]), margin=dict(t=80,b=55), legend=dict(orientation="h", y=-.08), annotations=list(fig.layout.annotations) + [dict(x=0, y=1.18*r_max, text="0° TWA", showarrow=False, font=dict(color="white", size=12)), dict(x=0, y=-1.18*r_max, text="180° TWA", showarrow=False, font=dict(color="white", size=12)), dict(x=1.14*r_max, y=0, text="90°", showarrow=False, font=dict(color="white", size=12))])
     return fig
 
-def polar_plot(df, m, polar, target, half, plot_space, y_range=None, colour_by_event=False):
+def polar_plot(df, m, polar, target, half, plot_space, y_range=None, colour_group=None):
     bsp, twa, tws, awa, vmg = [m.get(k) for k in ("bsp", "twa", "tws", "awa", "vmg")]
-    if colour_by_event and "Event" in df.columns and df["Event"].nunique(dropna=True) > 1:
-        # Build the grid/target once, then append one categorical-colour trace per event.
-        combined = polar_plot(df.iloc[0:0], m, polar, target, half, plot_space, y_range, False)
+    if colour_group and colour_group in df.columns and df[colour_group].nunique(dropna=True) > 1:
+        # Build the grid/target once, then append one categorical trace per group.
+        combined = polar_plot(df.iloc[0:0], m, polar, target, half, plot_space, y_range, None)
         palette = px.colors.qualitative.Plotly
-        for index, (event_name, event_data) in enumerate(df.groupby("Event", observed=True, sort=False)):
-            event_fig = polar_plot(event_data, m, None, None, half, plot_space, y_range, False)
-            for trace in event_fig.data:
+        for index, (group_name, group_data) in enumerate(
+            df.groupby(colour_group, observed=True, sort=False)
+        ):
+            group_fig = polar_plot(group_data, m, None, None, half, plot_space, y_range, None)
+            for trace in group_fig.data:
                 if getattr(trace, "name", None) == "Actual":
-                    trace.name = str(event_name)
-                    trace.legendgroup = str(event_name)
+                    trace.name = str(group_name)
+                    trace.legendgroup = str(group_name)
                     trace.marker.color = palette[index % len(palette)]
                     trace.marker.showscale = False
                     trace.marker.colorbar = None
                     combined.add_trace(trace)
-        combined.update_layout(title="Actual boat speed coloured by event")
+        combined.update_layout(title=f"Actual boat speed coloured by {colour_group.lower()}")
         return combined
     fig = go.Figure()
     if half and plot_space == "Polar":
@@ -857,18 +1011,18 @@ def polar_plot(df, m, polar, target, half, plot_space, y_range=None, colour_by_e
         hover_data = np.column_stack([d["_vmg_hover"], d["_tws_hover"]])
         marker = dict(size=5, opacity=.65, color=d[tws] if tws in d else "#00a6a6", colorscale="Turbo", showscale=tws in d, colorbar=dict(title="TWS kt") if tws in d else None)
         if plot_space == "Cartesian":
-            fig.add_trace(go.Scatter(x=d["Plot angle"], y=d[bsp], mode="markers", name="Actual", marker=marker, customdata=hover_data, hovertemplate="TWA: %{x:.1f}°<br>BSP: %{y:.2f} kt<br>VMG: %{customdata[0]:.2f} kt<br>TWS: %{customdata[1]:.2f} kt<extra></extra>"))
+            fig.add_trace(go.Scatter(x=d["Plot angle"], y=d[bsp], mode="markers", name="Actual", marker=marker, customdata=hover_data, hovertemplate="TWA: %{x:.4g}°<br>BSP: %{y:.4g} kt<br>VMG: %{customdata[0]:.4g} kt<br>TWS: %{customdata[1]:.4g} kt<extra></extra>"))
         else:
-            fig.add_trace(go.Scatterpolar(r=d[bsp], theta=d["Plot angle"], mode="markers", name="Actual", marker=marker, customdata=hover_data, hovertemplate="TWA: %{theta:.1f}°<br>BSP: %{r:.2f} kt<br>VMG: %{customdata[0]:.2f} kt<br>TWS: %{customdata[1]:.2f} kt<extra></extra>"))
+            fig.add_trace(go.Scatterpolar(r=d[bsp], theta=d["Plot angle"], mode="markers", name="Actual", marker=marker, customdata=hover_data, hovertemplate="TWA: %{theta:.4g}°<br>BSP: %{r:.4g} kt<br>VMG: %{customdata[0]:.4g} kt<br>TWS: %{customdata[1]:.4g} kt<extra></extra>"))
     if polar and target is not None:
         w = min(polar.tws, key=lambda x: abs(x-target)); c = polar.long[polar.long.TWS == w].sort_values("TWA")
         theta, r = (c.TWA, c["Target BSP"]) if half else (np.r_[-c.TWA.to_numpy()[::-1], c.TWA], np.r_[c["Target BSP"].to_numpy()[::-1], c["Target BSP"]])
         target_vmg = np.asarray(r, dtype=float) * np.cos(np.deg2rad(np.asarray(theta, dtype=float)))
         target_hover = np.column_stack([target_vmg, np.full(len(np.asarray(r)), float(w))])
         if plot_space == "Cartesian":
-            fig.add_trace(go.Scatter(x=theta, y=r, mode="lines", name=f"Target {w:g} kt", line=dict(color="#f28c28", width=4), customdata=target_hover, hovertemplate="TWA: %{x:.1f}°<br>Target BSP: %{y:.2f} kt<br>Target VMG: %{customdata[0]:.2f} kt<br>TWS: %{customdata[1]:.2f} kt<extra></extra>"))
+            fig.add_trace(go.Scatter(x=theta, y=r, mode="lines", name=f"Target {w:g} kt", line=dict(color="#f28c28", width=4), customdata=target_hover, hovertemplate="TWA: %{x:.4g}°<br>Target BSP: %{y:.4g} kt<br>Target VMG: %{customdata[0]:.4g} kt<br>TWS: %{customdata[1]:.4g} kt<extra></extra>"))
         else:
-            fig.add_trace(go.Scatterpolar(r=r, theta=theta, mode="lines", name=f"Target {w:g} kt", line=dict(color="#f28c28", width=4), customdata=target_hover, hovertemplate="TWA: %{theta:.1f}°<br>Target BSP: %{r:.2f} kt<br>Target VMG: %{customdata[0]:.2f} kt<br>TWS: %{customdata[1]:.2f} kt<extra></extra>"))
+            fig.add_trace(go.Scatterpolar(r=r, theta=theta, mode="lines", name=f"Target {w:g} kt", line=dict(color="#f28c28", width=4), customdata=target_hover, hovertemplate="TWA: %{theta:.4g}°<br>Target BSP: %{r:.4g} kt<br>Target VMG: %{customdata[0]:.4g} kt<br>TWS: %{customdata[1]:.4g} kt<extra></extra>"))
     if plot_space == "Cartesian":
         fig.update_layout(template="plotly_dark", height=690, title="Actual boat speed and target polar - cartesian", xaxis_title="TWA (°)", yaxis_title="Boat speed (kt)", legend=dict(orientation="h", y=-.12))
         if half: fig.update_xaxes(range=[0,180])
@@ -896,39 +1050,54 @@ def find_gun_events(events):
     return guns
 
 
+def gun_mask_for_dates(timestamps, events, dates):
+    """Return a compact row mask applying GUN-minus-five-minutes per event day."""
+    mask = np.ones(len(timestamps), dtype=bool)
+    warnings = []
+    guns = find_gun_events(events)
+    if guns.empty:
+        return mask, [
+            "No GUN entries were found in the Expedition events file. "
+            "Please filter by time manually."
+        ]
+    data_days = normalised_days(timestamps)
+    gun_days = normalised_days(guns["Time"])
+    for dte in dates:
+        day = pd.Timestamp(dte).normalize()
+        on_day = data_days.eq(day).to_numpy()
+        day_guns = guns.loc[gun_days.eq(day)]
+        if day_guns.empty:
+            warnings.append(
+                f"No GUN entry found for {dte}. Please filter this event manually if required."
+            )
+            continue
+        gun_time = pd.Timestamp(day_guns.iloc[0]["Time"])
+        mask[on_day] &= timestamps.loc[on_day].ge(
+            gun_time - pd.Timedelta(minutes=5)
+        ).to_numpy()
+    return mask, warnings
+
+
 def apply_gun_filter_for_dates(data, ts_col, events, dates):
-    """For selected event dates, remove data before GUN-5min where a gun is available."""
+    """Compatibility wrapper using the compact mask implementation."""
     if not ts_col or data.empty:
         return data, []
-    guns = find_gun_events(events)
-    warnings = []
-    if guns.empty:
-        return data, ["No GUN entries were found in the Expedition events file. Please filter by time manually."]
-    out_parts = []
-    for dte in dates:
-        day_data = data[pd.to_datetime(data[ts_col]).dt.date == dte].copy()
-        day_guns = guns[pd.to_datetime(guns["Time"]).dt.date == dte]
-        if day_guns.empty:
-            warnings.append(f"No GUN entry found for {dte}. Please filter this event manually if required.")
-            out_parts.append(day_data)
-        else:
-            gun_time = pd.Timestamp(day_guns.iloc[0]["Time"])
-            start_time = gun_time - pd.to_timedelta(5, unit="min")
-            out_parts.append(day_data[day_data[ts_col] >= start_time])
-    if not out_parts:
-        return data.iloc[0:0].copy(), warnings
-    return pd.concat(out_parts).sort_values(ts_col), warnings
+    mask, warnings = gun_mask_for_dates(data[ts_col], events, dates)
+    return data.loc[mask], warnings
 
 
 def add_event_labels(data, ts_col, selected_rows):
-    """Return a shallow frame with a compact Event category derived from event dates."""
-    if data is None or data.empty or not ts_col or ts_col not in data.columns or selected_rows is None or selected_rows.empty:
+    """Add compact Event categories using normalised datetime64 day keys."""
+    if (
+        data is None or data.empty or not ts_col or ts_col not in data.columns
+        or selected_rows is None or selected_rows.empty
+    ):
         return data
     date_to_event = {}
     for row in selected_rows[["date", "event"]].dropna().itertuples(index=False):
-        date_to_event.setdefault(row.date, str(row.event))
+        date_to_event.setdefault(pd.Timestamp(row.date).normalize(), str(row.event))
     out = data.copy(deep=False)
-    labels = pd.to_datetime(out[ts_col], errors="coerce").dt.date.map(date_to_event)
+    labels = normalised_days(out[ts_col]).map(date_to_event)
     out["Event"] = labels.fillna("Unassigned").astype("category")
     return out
 
@@ -944,71 +1113,89 @@ def safe_mean_abs(df, col):
 
 
 def make_event_summary(filtered, event_list, events, mapping, polar=None):
-    ts, twa, tws, awa, bsp, vmg, vmg_pct = [mapping.get(k) for k in ("timestamp", "twa", "tws", "awa", "bsp", "vmg", "vmg_pct")]
-    rows = []
-    polar_rows = []
-    gun_rows = []
+    ts, twa, tws, awa, bsp, vmg, vmg_pct = [
+        mapping.get(k)
+        for k in ("timestamp", "twa", "tws", "awa", "bsp", "vmg", "vmg_pct")
+    ]
+    rows, polar_rows, gun_rows = [], [], []
     if filtered.empty or not ts:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    summary_columns = []
+    for c in (ts, twa, tws, awa, bsp, vmg, vmg_pct):
+        if c and c in filtered.columns and c not in summary_columns:
+            summary_columns.append(c)
+    summary_data = filtered.loc[:, summary_columns]
+    summary_days = normalised_days(summary_data[ts])
     guns = find_gun_events(events)
+    gun_days = normalised_days(guns["Time"]) if not guns.empty else None
+
     if event_list is None or event_list.empty:
-        tmp = pd.DataFrame({"date": sorted(pd.to_datetime(filtered[ts]).dt.date.dropna().unique()), "event": "Selected data", "type": "Unknown"})
-        event_iter = tmp.to_dict("records")
+        unique_days = summary_days.dropna().drop_duplicates().sort_values()
+        event_iter = [
+            {"date": day.date(), "event": "Selected data", "type": "Unknown"}
+            for day in unique_days
+        ]
     else:
         event_iter = event_list.to_dict("records")
+
     polar_winds = polar.tws if polar is not None else []
     for ev in event_iter:
         dte = ev.get("date")
+        day = pd.Timestamp(dte).normalize()
         name = ev.get("event", str(dte))
-        sub = filtered[pd.to_datetime(filtered[ts]).dt.date == dte].copy()
+        sub = summary_data.loc[summary_days.eq(day)]
         if sub.empty:
             continue
-        abs_twa = signed_twa(sub[twa]).abs() if twa and twa in sub else pd.Series(index=sub.index, dtype=float)
-        up = sub[abs_twa < 60]
-        down = sub[abs_twa > 120]
+        abs_twa = (
+            signed_twa(sub[twa]).abs()
+            if twa and twa in sub else pd.Series(index=sub.index, dtype=float)
+        )
+        up = sub.loc[abs_twa < 60]
+        down = sub.loc[abs_twa > 120]
         gun_txt = ""
         if not guns.empty:
-            day_gun = guns[pd.to_datetime(guns["Time"]).dt.date == dte]
+            day_gun = guns.loc[gun_days.eq(day)]
             if not day_gun.empty:
-                gun_txt = pd.to_datetime(day_gun.iloc[0]["Time"]).strftime("%H:%M:%S")
-                gun_rows.append({"Event": name, "Date": dte, "GUN time": gun_txt, "Type": day_gun.iloc[0].get("Type", ""), "Comment": day_gun.iloc[0].get("Comment", "")})
-        uw_vmg_pct = safe_mean(up, vmg_pct)
-        dw_vmg_pct = safe_mean(down, vmg_pct)
+                gun_time = pd.Timestamp(day_gun.iloc[0]["Time"])
+                gun_txt = gun_time.strftime("%H:%M:%S")
+                gun_rows.append({
+                    "Event": name, "Date": dte, "GUN time": gun_txt,
+                    "Type": day_gun.iloc[0].get("Type", ""),
+                    "Comment": day_gun.iloc[0].get("Comment", ""),
+                })
         rows.append({
-            "Event": name,
-            "Type": ev.get("type", "Unknown"),
-            "Date": dte,
-            "Samples": len(sub),
-            "Avg TWS": safe_mean(sub, tws),
-            "UW BSP": safe_mean(up, bsp),
-            "UW VMG": safe_mean(up, vmg),
-            "UW VMG%": uw_vmg_pct,
-            "DW BSP": safe_mean(down, bsp),
-            "DW VMG": safe_mean(down, vmg),
-            "DW VMG%": dw_vmg_pct,
+            "Event": name, "Type": ev.get("type", "Unknown"), "Date": dte,
+            "Samples": len(sub), "Avg TWS": safe_mean(sub, tws),
+            "UW BSP": safe_mean(up, bsp), "UW VMG": safe_mean(up, vmg),
+            "UW VMG%": safe_mean(up, vmg_pct), "DW BSP": safe_mean(down, bsp),
+            "DW VMG": safe_mean(down, vmg), "DW VMG%": safe_mean(down, vmg_pct),
             "GUN": gun_txt or "Not found",
         })
         if polar_winds and tws and twa:
+            numeric_tws = pd.to_numeric(sub[tws], errors="coerce")
             for wind in polar_winds:
-                band = sub[pd.to_numeric(sub[tws], errors="coerce").between(wind-1, wind+1)].copy()
+                band = sub.loc[numeric_tws.between(wind - 1, wind + 1)]
                 if band.empty:
                     continue
                 band_abs = signed_twa(band[twa]).abs()
-                for mode, mode_df in [("Upwind |TWA|<60°", band[band_abs < 60]), ("Downwind |TWA|>120°", band[band_abs > 120])]:
+                for mode, mode_df, mode_abs in (
+                    ("Upwind |TWA|<60°", band.loc[band_abs < 60], band_abs.loc[band_abs < 60]),
+                    ("Downwind |TWA|>120°", band.loc[band_abs > 120], band_abs.loc[band_abs > 120]),
+                ):
                     if mode_df.empty:
                         continue
                     polar_rows.append({
-                        "Event": name,
-                        "Polar TWS": wind,
-                        "Mode": mode,
-                        "Samples": len(mode_df),
-                        "TWA": safe_mean(mode_df.assign(_abs_twa=signed_twa(mode_df[twa]).abs()), "_abs_twa"),
-                        "AWA": safe_mean_abs(mode_df, awa),
-                        "BSP": safe_mean(mode_df, bsp),
-                        "VMG": safe_mean(mode_df, vmg),
-                        "VMG%": safe_mean(mode_df, vmg_pct),
+                        "Event": name, "Polar TWS": wind, "Mode": mode,
+                        "Samples": len(mode_df), "TWA": float(mode_abs.mean()),
+                        "AWA": safe_mean_abs(mode_df, awa), "BSP": safe_mean(mode_df, bsp),
+                        "VMG": safe_mean(mode_df, vmg), "VMG%": safe_mean(mode_df, vmg_pct),
                     })
-    return round_numeric_df(pd.DataFrame(rows)), round_numeric_df(pd.DataFrame(polar_rows)), pd.DataFrame(gun_rows)
+    return (
+        round_numeric_df(pd.DataFrame(rows)),
+        round_numeric_df(pd.DataFrame(polar_rows)),
+        pd.DataFrame(gun_rows),
+    )
 
 
 def read_debrief_file(uploaded):
@@ -1095,8 +1282,7 @@ h1,h2,h3,h4,h5,h6,p{ text-align:center; }
 
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
-    if CSS:
-        st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(CSS, unsafe_allow_html=True)
     if not require_password():
         st.stop()
     pass
@@ -1155,7 +1341,8 @@ def main():
         m[k] = saved if saved is None or saved in df.columns else m.get(k)
     ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
 
-    filtered = df
+    row_mask = np.ones(len(df), dtype=bool)
+    filtered_positions = np.arange(len(df), dtype=np.int64)
     selected_events = []
     selected_event_dates = []
     selected_rows = pd.DataFrame(columns=["date", "type", "event"])
@@ -1209,22 +1396,38 @@ def main():
             st.caption("Map a timestamp column to enable event filtering.")
 
     if ts and pd.api.types.is_datetime64_any_dtype(df[ts]):
+        timestamps = df[ts]
         if selected_events:
-            selected_rows = filtered_event_list[filtered_event_list["event"].isin(selected_events)].copy()
+            selected_rows = filtered_event_list.loc[
+                filtered_event_list["event"].isin(selected_events)
+            ].copy()
             selected_event_dates = selected_rows["date"].tolist()
-            filtered = filtered[pd.to_datetime(filtered[ts]).dt.date.isin(selected_event_dates)]
-            filtered, gun_warnings = apply_gun_filter_for_dates(filtered, ts, events, selected_event_dates)
+            selected_days = pd.DatetimeIndex(selected_event_dates).normalize()
+            row_mask &= normalised_days(timestamps).isin(selected_days).to_numpy()
+            gun_mask, gun_warnings = gun_mask_for_dates(
+                timestamps, events, selected_event_dates
+            )
+            row_mask &= gun_mask
             pending_gun_warnings = gun_warnings
             if trim_data:
-                row_times = pd.to_datetime(filtered[ts]).dt.time
-                filtered = filtered[(row_times >= start_t) & (row_times <= end_t)]
+                seconds = seconds_since_midnight(timestamps)
+                start_seconds = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
+                end_seconds = end_t.hour * 3600 + end_t.minute * 60 + end_t.second
+                row_mask &= (seconds >= start_seconds) & (seconds <= end_seconds)
+                del seconds
         elif isinstance(dates, tuple) and len(dates) == 2:
-            date_start = pd.Timestamp.combine(dates[0], start_t if trim_data else time(0, 0))
-            date_end = pd.Timestamp.combine(dates[1], end_t if trim_data else time(23, 59, 59, 999999))
+            date_start = pd.Timestamp.combine(
+                dates[0], start_t if trim_data else time(0, 0)
+            )
+            date_end = pd.Timestamp.combine(
+                dates[1], end_t if trim_data else time(23, 59, 59, 999999)
+            )
             if date_end < date_start:
                 st.sidebar.warning("End time is before start time; no time trim was applied.")
             else:
-                filtered = filtered[filtered[ts].between(date_start, date_end)]
+                row_mask &= timestamps.between(date_start, date_end).to_numpy()
+        filtered_positions = np.flatnonzero(row_mask)
+        del row_mask
 
     st.sidebar.subheader("Column mapping")
     for k in mapping_keys:
@@ -1241,48 +1444,35 @@ def main():
     # A single active page is executed per rerun. Streamlit tabs execute every tab,
     # including hidden plotting code, which was the main source of temporary RAM growth.
     page_names = ["Overview","Event summary","Polar analysis","GPS track","Variable plot","Files and sail chart"]
-    # Style only the top-level analysis page selector as a clean navigation row.
-    # The row has one theme-colour rule beneath it; labels have no boxes.
     st.markdown("""
     <style>
-    div[data-testid="stRadio"]:has(input[value="Overview"]) div[role="radiogroup"] {
-      gap:1.25rem;
-      border-bottom:2px solid var(--nightjar-orange) !important;
-      padding-bottom:0;
-    }
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label {
-      padding:.55rem .15rem;
-      margin-right:0;
-      border:0 !important;
-      border-radius:0 !important;
-      outline:0 !important;
-      background:transparent !important;
-      box-shadow:none !important;
-      cursor:pointer;
-    }
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label:has(input:checked) {
-      color:var(--nightjar-orange) !important;
-      background:transparent !important;
-      box-shadow:none !important;
-      font-weight:700;
-    }
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover,
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label:focus-within {
-      color:var(--nightjar-orange) !important;
-      border:0 !important;
-      outline:0 !important;
-      background:transparent !important;
-      box-shadow:none !important;
-    }
+    div[data-testid="stRadio"]:has(input[value="Overview"]) div[role="radiogroup"]{gap:1.25rem;border-bottom:1px solid rgba(242,140,40,.55);padding-bottom:0;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label{padding:.55rem .15rem;border:0!important;border-radius:0!important;background:transparent!important;cursor:pointer;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:has(input:checked){color:#f28c28!important;border-bottom:3px solid #f28c28!important;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover{color:#f28c28!important;}
     </style>
     """, unsafe_allow_html=True)
+    st.markdown("""<style>div[role=radiogroup]{border-bottom:none!important;} div[role=radiogroup] label{border:2px solid #666;padding:8px 16px;border-radius:10px 10px 0 0;margin-right:4px;} div[role=radiogroup] label:has(input:checked){border-color:#f28c28;background:rgba(242,140,40,.15);} </style>""",unsafe_allow_html=True)
     active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
     previous_page = st.session_state.get("nightjar_previous_page")
     if previous_page != active_page:
         st.session_state["nightjar_previous_page"] = active_page
         gc.collect()
+
     if active_page == "Overview":
-        colour_by_event_overview = st.toggle("Colour by event", value=False, key="overview_colour_by_event", disabled=not multi_event) if multi_event else False
+        page_columns = [ts, bsp, tws, vmg, vmg_pct, heel, twa]
+    elif active_page == "Event summary":
+        page_columns = [ts, twa, tws, awa, bsp, vmg, vmg_pct]
+    elif active_page == "Polar analysis":
+        page_columns = [ts, bsp, twa, tws, awa, vmg, vmg_pct, heel, drift, m.get("lat"), m.get("lon")]
+    elif active_page in ("GPS track", "Variable plot"):
+        page_columns = [ts] + df.select_dtypes(include=np.number).columns.tolist()
+    else:
+        page_columns = None
+    filtered = select_filtered_rows(df, filtered_positions, page_columns)
+
+    if active_page == "Overview":
+        colour_group_overview = colour_group_controls("overview", multi_event, bool(twa))
         ms = st.columns(5)
         ms[0].metric("Rows", f"{len(filtered):,}")
         ms[1].metric("Mean BSP", f"{filtered[bsp].mean():.2f} kt" if bsp else "n/a")
@@ -1293,13 +1483,31 @@ def main():
             cols = [c for c in (bsp,tws,vmg,vmg_pct,heel,twa) if c]
             if cols:
                 overview_plot_df = downsample_rows(filtered, max_plot_points) if performance_mode else filtered
-                overview_plot_df = add_event_labels(overview_plot_df, ts, selected_rows) if colour_by_event_overview else overview_plot_df
-                id_columns = [ts] + (["Event"] if colour_by_event_overview and "Event" in overview_plot_df else [])
-                long = overview_plot_df[id_columns + cols].melt(id_columns, var_name="Channel", value_name="Value").dropna()
-                if colour_by_event_overview and "Event" in long:
-                    fig = px.line(long, x=ts, y="Value", color="Event", line_dash="Channel", title="Selected time series coloured by event")
+                if colour_group_overview == "Event":
+                    overview_plot_df = add_event_labels(overview_plot_df, ts, selected_rows)
+                elif colour_group_overview == "Tack":
+                    overview_plot_df = add_tack_labels(overview_plot_df, twa)
+                id_columns = [ts] + (
+                    [colour_group_overview]
+                    if colour_group_overview and colour_group_overview in overview_plot_df else []
+                )
+                long = overview_plot_df[id_columns + cols].melt(
+                    id_columns, var_name="Channel", value_name="Value"
+                ).dropna()
+                if colour_group_overview and colour_group_overview in long:
+                    fig = px.line(
+                        long, x=ts, y="Value", color=colour_group_overview,
+                        line_dash="Channel",
+                        title=f"Selected time series coloured by {colour_group_overview.lower()}",
+                    )
                 else:
-                    fig = px.line(long, x=ts, y="Value", color="Channel", title="Selected time series including VMG and TWA")
+                    fig = px.line(
+                        long, x=ts, y="Value", color="Channel",
+                        title="Selected time series including VMG and TWA",
+                    )
+                fig.update_traces(
+                    hovertemplate="%{x}<br>%{fullData.name}<br>Value: %{y:.4g}<extra></extra>"
+                )
                 fig.update_layout(template="plotly_dark", height=430)
                 st.plotly_chart(fig, width="stretch")
         st.dataframe(round_numeric_df(filtered.head(500)), width="stretch", height=310)
@@ -1329,7 +1537,7 @@ def main():
             st.info("Upload a .txt, .md or .docx debrief notes file in the sidebar to view it here.")
 
     if active_page == "Polar analysis":
-        colour_by_event_polar = st.toggle("Colour by event", value=False, key="polar_colour_by_event", disabled=not multi_event) if multi_event else False
+        colour_group_polar = colour_group_controls("polar", multi_event, bool(twa))
         c1,c2,c3,c4 = st.columns(4)
         with c1: point = st.radio("Point of sail", ["All","Upwind (0 to 90°)","Downwind (90 to 180°)"], key="polar_point")
         with c2: layout = st.radio("Polar layout", ["Full polar","Half polar (absolute TWA)"], key="polar_layout")
@@ -1355,14 +1563,17 @@ def main():
         local_data = point_filter(filtered.loc[:, polar_cols], twa, point)
         if tws and polar and not use_all: local_data = local_data[local_data[tws].between(target-tol, target+tol)]
         local_data, avg_note = average_with_ranges(local_data, ts, avg_cols, int(avg_sec), {tws:max_tws_var,bsp:max_bsp_var}, signed_twa_col=twa)
-        if colour_by_event_polar:
+        if colour_group_polar == "Event":
             local_data = add_event_labels(local_data, ts, selected_rows)
+        elif colour_group_polar == "Tack":
+            local_data = add_tack_labels(local_data, twa)
         st.session_state["nightjar_avg_settings"] = {"seconds":int(avg_sec), "max_tws":max_tws_var, "max_bsp":max_bsp_var}
         st.caption(f"Plotting {len(local_data):,} records | {avg_note}. Half polar uses 0° to 180°.")
         if bsp and twa:
-            st.plotly_chart(polar_plot(local_data, m, polar, target, layout.startswith("Half"), plot_space, (yr_min,yr_max), colour_by_event_polar), width="stretch")
+            st.plotly_chart(polar_plot(local_data, m, polar, target, layout.startswith("Half"), plot_space, (yr_min,yr_max), colour_group_polar), width="stretch")
     if active_page == "GPS track":
-        colour_by_event_gps = st.toggle("Colour by event", value=False, key="gps_colour_by_event", disabled=not multi_event) if multi_event else False
+        colour_group_gps = colour_group_controls("gps", multi_event, bool(twa))
+        categorical_colour_gps = bool(colour_group_gps)
         lat, lon = m.get("lat"), m.get("lon")
         if lat and lon and int((filtered[lat].notna() & filtered[lon].notna()).sum()) > 1:
             settings = st.session_state.get("nightjar_avg_settings", {"seconds": 1, "max_tws": 99.0, "max_bsp": 99.0})
@@ -1373,9 +1584,9 @@ def main():
             else:
                 g1, g2, g3, g4 = st.columns(4)
                 with g1:
-                    colour = st.selectbox("Colour track by", nums, index=nums.index(default_colour) if default_colour in nums else 0, key="gps_colour_by", disabled=colour_by_event_gps)
+                    colour = st.selectbox("Colour track by", nums, index=nums.index(default_colour) if default_colour in nums else 0, key="gps_colour_by", disabled=categorical_colour_gps)
                 with g2:
-                    abs_colour = st.checkbox("Use absolute colour values", key="gps_abs_colour_values", disabled=colour_by_event_gps)
+                    abs_colour = st.checkbox("Use absolute colour values", key="gps_abs_colour_values", disabled=categorical_colour_gps)
 
                 # Average only the selected colour and hover channels, rather than every
                 # numeric log channel. This is substantially smaller for wide Expedition logs.
@@ -1397,10 +1608,12 @@ def main():
                     valid_positions = valid_positions[::math.ceil(len(valid_positions) / gps_limit)]
                 d = gps_base.iloc[valid_positions].copy()
                 del gps_base, valid_positions
-                if ts and ts in d:
-                    d["Time"] = pd.to_datetime(d[ts], errors="coerce").dt.round("s").dt.strftime("%d-%b-%Y %H:%M:%S")
-                if colour_by_event_gps:
+                if colour_group_gps == "Event":
                     d = add_event_labels(d, ts, selected_rows)
+                elif colour_group_gps == "Tack":
+                    d = add_tack_labels(d, twa)
+                if categorical_colour_gps:
+                    abs_colour = False
                 colour_plot = f"abs({colour})" if abs_colour else colour
                 if abs_colour:
                     d[colour_plot] = d[colour].abs()
@@ -1415,48 +1628,51 @@ def main():
                 if st.session_state.get("gps_colour_max", 1.0) <= st.session_state.get("gps_colour_min", 0.0):
                     st.session_state["gps_colour_max"] = st.session_state.get("gps_colour_min", 0.0) + 0.001
                 with g3:
-                    cmin = st.number_input("Colour scale min", key="gps_colour_min", disabled=colour_by_event_gps)
+                    cmin = st.number_input("Colour scale min", key="gps_colour_min", disabled=categorical_colour_gps)
                 with g4:
-                    cmax = st.number_input("Colour scale max", key="gps_colour_max", disabled=colour_by_event_gps)
+                    cmax = st.number_input("Colour scale max", key="gps_colour_max", disabled=categorical_colour_gps)
 
-                hover_cols = [c for c in ("Time" if ts else None, twa, tws, awa, heel, vmg, vmg_pct, drift, bsp) if c and c in d]
-                hover_text = []
-                for _, row in d.iterrows():
-                    parts = []
-                    for col in hover_cols:
-                        val = row[col]
-                        if isinstance(val, (float, np.floating)):
-                            parts.append(f"{col}: {val:.2f}")
-                        else:
-                            parts.append(f"{col}: {val}")
-                    hover_text.append("<br>".join(parts))
-
+                hover_numeric = [
+                    c for c in (twa, tws, awa, heel, vmg, vmg_pct, drift, bsp)
+                    if c and c in d
+                ]
                 centre = {"lat": float(d[lat].mean()), "lon": float(d[lon].mean())}
 
-                # Use pure graph_objects Scattermapbox for both the line and points.
-                # This deliberately avoids Plotly Express map figures and avoids copying any mapbox layout object,
-                # because copied mapbox layout objects were causing the browser-side 'No valid mapbox style found' error.
-                d["_Hover"] = hover_text
                 fig = go.Figure()
                 fig.add_trace(go.Scattermap(
                     lat=d[lat], lon=d[lon], mode="lines", name="Track line",
                     line=dict(color="rgba(242,140,40,0.58)", width=2), hoverinfo="skip",
                 ))
-                if colour_by_event_gps and "Event" in d:
+                if colour_group_gps and colour_group_gps in d:
                     palette = px.colors.qualitative.Plotly
-                    for colour_index, (event_name, event_data) in enumerate(d.groupby("Event", observed=True, sort=False)):
+                    for colour_index, (group_name, group_data) in enumerate(
+                        d.groupby(colour_group_gps, observed=True, sort=False)
+                    ):
+                        hover_time, hover_data, hover_template = compact_hover_payload(
+                            group_data, ts, hover_numeric
+                        )
                         fig.add_trace(go.Scattermap(
-                            lat=event_data[lat], lon=event_data[lon], mode="markers", name=str(event_name),
-                            text=event_data["_Hover"], hovertemplate="%{text}<extra></extra>",
-                            marker=dict(size=8, color=palette[colour_index % len(palette)], opacity=0.82),
+                            lat=group_data[lat], lon=group_data[lon], mode="markers",
+                            name=str(group_name), text=hover_time, customdata=hover_data,
+                            hovertemplate=hover_template,
+                            marker=dict(
+                                size=8, color=palette[colour_index % len(palette)], opacity=0.82
+                            ),
                         ))
-                    gps_title = f"GPS track coloured by event ({avg_note})"
+                    gps_title = (
+                        f"GPS track coloured by {colour_group_gps.lower()} ({avg_note})"
+                    )
                 else:
+                    hover_time, hover_data, hover_template = compact_hover_payload(
+                        d, ts, hover_numeric
+                    )
                     fig.add_trace(go.Scattermap(
                         lat=d[lat], lon=d[lon], mode="markers", name=colour_plot,
-                        text=d["_Hover"], hovertemplate="%{text}<extra></extra>",
-                        marker=dict(size=8, color=d[colour_plot], colorscale="Turbo", cmin=cmin, cmax=cmax,
-                                    colorbar=dict(title=colour_plot), opacity=0.82),
+                        text=hover_time, customdata=hover_data, hovertemplate=hover_template,
+                        marker=dict(
+                            size=8, color=d[colour_plot], colorscale="Turbo",
+                            cmin=cmin, cmax=cmax, colorbar=dict(title=colour_plot), opacity=0.82,
+                        ),
                     ))
                     gps_title = f"GPS track coloured by {colour_plot} ({avg_note})"
                 fig.update_layout(
@@ -1470,7 +1686,8 @@ def main():
             st.dataframe(round_numeric_df(events), width="stretch", height=240)
 
     if active_page == "Variable plot":
-        colour_by_event_var = st.toggle("Colour by event", value=False, key="var_colour_by_event", disabled=not multi_event) if multi_event else False
+        colour_group_var = colour_group_controls("var", multi_event, bool(twa))
+        categorical_colour_var = bool(colour_group_var)
         nums = filtered.select_dtypes(include=np.number).columns.tolist()
         if len(nums) < 2:
             st.info("At least two numeric variables are required")
@@ -1483,8 +1700,8 @@ def main():
                 y = st.selectbox("Radial / Y variable", nums, index=nums.index(bsp) if bsp in nums else min(1,len(nums)-1), key="var_y")
                 absy = st.checkbox("Use absolute Y values", key="var_abs_y_values")
             with v3:
-                colour = st.selectbox("Colour", ["None"]+nums, index=(["None"]+nums).index(tws) if tws in nums else 0, key="var_colour", disabled=colour_by_event_var)
-                absc = st.checkbox("Use absolute colour values", key="var_abs_colour_values", disabled=colour_by_event_var or colour=="None")
+                colour = st.selectbox("Colour", ["None"]+nums, index=(["None"]+nums).index(tws) if tws in nums else 0, key="var_colour", disabled=categorical_colour_var)
+                absc = st.checkbox("Use absolute colour values", key="var_abs_colour_values", disabled=categorical_colour_var or colour=="None")
             with v4:
                 kind = st.radio("Plot type", ["Cartesian","Polar"], key="var_plot_type")
 
@@ -1496,16 +1713,23 @@ def main():
             with w3:
                 y_tol = st.number_input("Max Y variation in window", min_value=0.0, value=99.0, step=.5, key="var_y_tol")
             with w4:
-                c_tol = st.number_input("Max colour variation in window", min_value=0.0, value=99.0, step=.5, disabled=colour=="None" or colour_by_event_var, key="var_colour_tol")
+                c_tol = st.number_input("Max colour variation in window", min_value=0.0, value=99.0, step=.5, disabled=colour=="None" or categorical_colour_var, key="var_colour_tol")
 
-            numeric_colour = colour != "None" and not colour_by_event_var
-            avg_columns = [x,y] + ([colour] if numeric_colour else []) + ([tws] if tws else [])
+            numeric_colour = colour != "None" and not categorical_colour_var
+            avg_columns = (
+                [x, y]
+                + ([colour] if numeric_colour else [])
+                + ([tws] if tws else [])
+                + ([twa] if colour_group_var == "Tack" and twa else [])
+            )
             tolerances = {x:x_tol, y:y_tol}
             if numeric_colour:
                 tolerances[colour] = c_tol
             vd, avg_note = average_with_ranges(filtered, ts, avg_columns, int(vavg), tolerances, signed_twa_col=x if x==twa else None)
-            if colour_by_event_var:
+            if colour_group_var == "Event":
                 vd = add_event_labels(vd, ts, selected_rows)
+            elif colour_group_var == "Tack":
+                vd = add_tack_labels(vd, twa)
             xn = f"abs({x})" if absx else x
             yn = f"abs({y})" if absy else y
             cn = f"abs({colour})" if absc and numeric_colour else colour
@@ -1586,20 +1810,32 @@ def main():
                 axis_ymax = axis_ymin + .001
 
             if kind == "Cartesian":
-                if colour_by_event_var and "Event" in vd:
-                    fig = px.scatter(vd, x=xn, y=yn, color="Event", opacity=.62)
+                if colour_group_var and colour_group_var in vd:
+                    fig = px.scatter(vd, x=xn, y=yn, color=colour_group_var, opacity=.62)
                 else:
                     fig = px.scatter(vd, x=xn, y=yn, color=cn if numeric_colour else None, opacity=.62,
                                      color_continuous_scale="Turbo", range_color=colour_range)
+                fig.update_traces(
+                    hovertemplate=f"{xn}: %{{x:.4g}}<br>{yn}: %{{y:.4g}}<extra></extra>"
+                )
                 fig.update_xaxes(range=[axis_xmin,axis_xmax])
                 fig.update_yaxes(range=[axis_ymin,axis_ymax])
             else:
                 fig = go.Figure()
-                if colour_by_event_var and "Event" in vd:
+                if colour_group_var and colour_group_var in vd:
                     palette = px.colors.qualitative.Plotly
-                    for colour_index,(event_name,event_data) in enumerate(vd.groupby("Event", observed=True, sort=False)):
-                        fig.add_trace(go.Scatterpolar(theta=event_data[xn], r=event_data[yn], mode="markers", name=str(event_name),
-                                                      marker=dict(size=6, opacity=.62, color=palette[colour_index % len(palette)])))
+                    for colour_index, (group_name, group_data) in enumerate(
+                        vd.groupby(colour_group_var, observed=True, sort=False)
+                    ):
+                        fig.add_trace(go.Scatterpolar(
+                            theta=group_data[xn], r=group_data[yn], mode="markers",
+                            name=str(group_name),
+                            marker=dict(
+                                size=6, opacity=.62,
+                                color=palette[colour_index % len(palette)],
+                            ),
+                            hovertemplate=f"{xn}: %{{theta:.4g}}<br>{yn}: %{{r:.4g}}<extra></extra>",
+                        ))
                 else:
                     marker = dict(size=6, opacity=.62, color=vd[cn] if numeric_colour else "#00a6a6",
                                   colorscale="Turbo", showscale=numeric_colour,
@@ -1607,7 +1843,7 @@ def main():
                     if colour_range:
                         marker.update(cmin=colour_range[0], cmax=colour_range[1])
                     fig.add_trace(go.Scatterpolar(theta=vd[xn], r=vd[yn], mode="markers", marker=marker,
-                                                  hovertemplate=f"{xn}: %{{theta:.2f}}<br>{yn}: %{{r:.2f}}<extra></extra>"))
+                                                  hovertemplate=f"{xn}: %{{theta:.4g}}<br>{yn}: %{{r:.4g}}<extra></extra>"))
                 fig.update_layout(polar=dict(sector=[axis_xmin,axis_xmax],
                                              angularaxis=dict(direction="clockwise", rotation=90),
                                              radialaxis=dict(range=[axis_ymin,axis_ymax])))
@@ -1622,11 +1858,11 @@ def main():
         download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
         filtered_mb = dataframe_memory_mb(filtered)
         if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.7.10.6.csv", "text/csv", key="download_filtered")
+            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.8.0.csv", "text/csv", key="download_filtered")
         else:
             st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.7.10.6.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.8.0.json", "application/json", key="download_session")
     # Refresh after the active page has been built so the sidebar reports the
     # process resident set, including the current plot's temporary objects.
     gc.collect()
