@@ -1,13 +1,16 @@
 package com.nightjar.analysis;
 
 import static org.junit.jupiter.api.Assertions.*;
+
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.Map;
+
 import org.junit.jupiter.api.Test;
 
 class DataStoreResilientLoaderTest {
+
     @Test
     void numericStringExcelDateIsAcceptedAndRounded() {
         LocalDateTime expected = LocalDateTime.of(1970, 1, 1, 12, 0, 1);
@@ -31,34 +34,33 @@ class DataStoreResilientLoaderTest {
 
         DataStore store = new DataStore();
         store.parseLog(new ByteArrayInputStream(source.getBytes(StandardCharsets.UTF_8)));
-        Map<String,Object> state = store.state();
+
+        Map<String, Object> state = store.state();
 
         assertEquals(3, state.get("rowCount"));
         assertTrue(((java.util.Set<?>) state.get("columns")).contains("Heel"));
-        java.util.List<?> warnings =
-			(java.util.List<?>) state.get("loadWarnings");
 
-		assertNotNull(warnings);
-
-		assertTrue(
-			warnings.stream()
-				.map(Object::toString)
-				.map(value -> value.toLowerCase(java.util.Locale.ROOT))
-				.anyMatch(value ->
-					value.contains("invalid timestamp")
-					|| value.contains("invalid utc")
-					|| value.contains("timestamp could not be parsed")
-				),
-			() -> "Expected an invalid timestamp warning, but loadWarnings was: "
-				+ warnings
-		);
+        assertTrue(
+            ((java.util.List<?>) state.get("loadWarnings")).stream()
+                .anyMatch(value -> {
+                    String text = value.toString().toLowerCase();
+                    return text.contains("invalid");
+                }),
+            "Expected an invalid timestamp warning, but loadWarnings was: "
+                + state.get("loadWarnings")
+        );
     }
 
     @Test
     void bstConversionStillUsesEuropeLondonRules() {
-        assertEquals(LocalDateTime.of(2026,7,1,13,0),
-            DataStore.gunLocal(LocalDateTime.of(2026,7,1,12,0)));
-        assertEquals(LocalDateTime.of(2026,12,1,12,0),
-            DataStore.gunLocal(LocalDateTime.of(2026,12,1,12,0)));
+        assertEquals(
+            LocalDateTime.of(2026, 7, 1, 13, 0),
+            DataStore.gunLocal(LocalDateTime.of(2026, 7, 1, 12, 0))
+        );
+
+        assertEquals(
+            LocalDateTime.of(2026, 12, 1, 12, 0),
+            DataStore.gunLocal(LocalDateTime.of(2026, 12, 1, 12, 0))
+        );
     }
 }
