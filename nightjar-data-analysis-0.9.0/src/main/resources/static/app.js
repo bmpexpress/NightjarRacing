@@ -27,13 +27,94 @@ const axis=(row,v)=>v==="__TIME__"?row[NJ.state.mapping.timestamp]:row[v];functi
 
 async function save(){const mapping={};document.querySelectorAll(".map").forEach(e=>mapping[e.dataset.key]=e.value||null);const body={includedVariables:[...document.querySelectorAll(".var:checked")].map(e=>e.value),mapping,plotDownsamplingEnabled:$("downsample").checked,maxPlotPoints:Number($("maxPoints").value)};try{NJ.state=await post("/api/settings",body);configure();await refresh();msg("Settings saved.");}catch(e){msg(e.message);}}
 async function exportCsv(){try{const r=await fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(request())});if(!r.ok)throw new Error("Export failed");const a=document.createElement("a");a.href=URL.createObjectURL(await r.blob());a.download="nightjar_filtered_log_0.9.0.csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000);}catch(e){msg(e.message);}}
+function revealStartupError(error) {
+    console.error("Nightjar startup failed", error);
+
+    const loginPanel = $("login");
+    const appPanel = $("app");
+    const messagePanel = $("messages");
+
+    // Never leave both panels hidden if startup fails.
+    if (loginPanel) loginPanel.classList.add("hidden");
+    if (appPanel) appPanel.classList.remove("hidden");
+    if (messagePanel) {
+        messagePanel.innerHTML = `<div class="notice">Startup error: ${esc(error?.message || error)}</div>`;
+    }
+}
+
+function bindUi() {
+    $("signIn").onclick = async () => {
+        try {
+            await post("/api/login", {password: $("password").value});
+            show(true);
+            await state();
+        } catch (error) {
+            msg(error.message);
+        }
+    };
+
+    $("password").addEventListener("keydown", event => {
+        if (event.key === "Enter") $("signIn").click();
+    });
+
+    $("logout").onclick = async () => {
+        await api("/api/logout", {method: "POST"});
+        location.reload();
+    };
+
+    $("upload").onsubmit = async event => {
+        event.preventDefault();
+        try {
+            NJ.state = await api("/api/upload", {
+                method: "POST",
+                body: new FormData(event.target)
+            });
+            configure();
+            await refresh();
+        } catch (error) {
+            msg(error.message);
+        }
+    };
+
+    $("apply").onclick = refresh;
+    $("save").onclick = save;
+    $("all").onclick = () => document.querySelectorAll(".var").forEach(item => item.checked = true);
+    $("none").onclick = () => document.querySelectorAll(".var").forEach(item => item.checked = false);
+    $("downsample").onchange = () => $("maxPoints").disabled = !$("downsample").checked;
+    $("csv").onclick = exportCsv;
+    $("session").onclick = () => location.href = "/api/session";
+
+    ["polarTws", "polarTol"].forEach(id => $(id).onchange = polar);
+    $("gpsColour").onchange = gps;
+    ["varX", "varY", "varColour", "varKind"].forEach(id => $(id).onchange = variable);
+
+    $("tabs").onclick = event => {
+        const button = event.target.closest(".tab");
+        if (!button) return;
+
+        document.querySelectorAll(".tab,.page").forEach(item => item.classList.remove("active"));
+        button.classList.add("active");
+
+        const page = $("page-" + button.dataset.page);
+        if (page) page.classList.add("active");
+        window.dispatchEvent(new Event("resize"));
+    };
+}
+
 function initialise() {
-    ...
-    boot().catch(e => msg(e.message));
+    if (window.__nightjarInitialised) return;
+    window.__nightjarInitialised = true;
+
+    try {
+        bindUi();
+        boot().catch(revealStartupError);
+    } catch (error) {
+        revealStartupError(error);
+    }
 }
 
 if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initialise);
+    document.addEventListener("DOMContentLoaded", initialise, {once: true});
 } else {
     initialise();
 }
