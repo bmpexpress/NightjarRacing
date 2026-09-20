@@ -1,84 +1,118 @@
-# Nightjar 0.9.0 — sequential logfile loader patch
+# Nightjar Data Analysis 0.9.0 — resilient sequential-loader update
 
-This patch replaces the memory-heavy logfile path in the Java 0.9.0 project.
+This folder is ready to copy into the existing Nightjar Java 0.9.0 GitHub repository. Preserve the paths when uploading.
 
-## Replace these files
+## Replace/add these files
 
-Copy the files in this archive over the same paths in the existing Java project:
+- Replace `src/main/java/com/nightjar/analysis/DataStore.java`
+- Replace `src/main/java/com/nightjar/analysis/Models.java`
+- Replace `src/main/resources/application.properties`
+- Replace `Dockerfile`
+- Replace `railway.toml`
+- Add `src/test/java/com/nightjar/analysis/DataStoreResilientLoaderTest.java`
+- Optionally retain `railway-variables.env.example` as documentation; do not commit real passwords.
 
-- `src/main/java/com/nightjar/analysis/DataStore.java`
-- `src/main/java/com/nightjar/analysis/Models.java`
-- `src/main/resources/application.properties`
-- `Dockerfile`
-- `railway.toml`
+No changes are required to `WebController.java`, `NightjarApplication.java`, `pom.xml`, or the static website files.
 
-Do not replace `WebController.java`, `NightjarApplication.java` or the static website files.
+## Why the previous deployment reported zero rows
 
-## What changed
+The deployment log showed more than 501,000 physical records being read, followed by `Loaded 0 rows sequentially`. Sparse Expedition UTC values were retained as Strings. Numeric Excel-style UTC strings therefore failed timestamp conversion and every record was removed after reading.
 
-1. `logfile.csv` is opened as a buffered `InputStream` and parsed record by record.
-2. Uploads use `MultipartFile.getInputStream()` instead of `getBytes()`.
-3. The loader no longer creates a whole-file byte array and a second whole-file Java String.
-4. Per-row `LinkedHashMap` storage is replaced with compact parallel key/value arrays. Blank sparse channels allocate nothing.
-5. New data are committed only after a complete successful parse; a failed replacement does not destroy a working dataset.
-6. Heap is checked every 2,048 accepted rows, with progress reported approximately every 250,000 rows.
-7. At the default 3,200 MiB loading threshold, loading stops cleanly before the 4 GiB heap is exhausted.
-8. A guarded startup failure leaves the web server online rather than creating a Railway restart loop.
-9. `/api/state` reports `heapUsedMiB`, `heapMaxMiB`, `loadHeapLimitMiB` and `loadStatus`.
+This update performs timestamp conversion while each record is read and recognises Excel serial dates supplied either as a Java Number or numeric text.
 
-## Railway variables
+## Resilience changes
 
-The Dockerfile defaults are:
+### Dynamic logfile schemas
+
+Both sparse and standard log readers recognise repeated header sections. A new `!Boat,Utc,...` row resets the sparse schema, and the following `!Boat,<channel id>,...` row rebuilds the ID-to-name map. Header and ID row widths are paired with `Math.min(...)`, so a trailing blank or added/removed variable does not invalidate the section.
+
+Standard CSV files similarly discover repeated headers containing a timestamp channel and update the current column positions.
+
+### Row-level failures
+
+- Invalid timestamp: skip that row only.
+- Short/malformed row: skip that row only.
+- Unknown sparse channel ID: skip that value pair only.
+- Odd trailing sparse field: retain the recognised part of the row and count a warning.
+- Other boat number: skip that row only.
+- Repeated or changed schema: rebuild the mapping and continue.
+- Fatal parser error after valid rows: keep the previously accepted rows as a partial load.
+- Loader memory guard reached: keep accepted rows as a partial load rather than discarding them.
+
+### Isolated file loading
+
+The startup sequence loads the logfile, polar, Expedition events, event list, and sail chart in independent guarded operations. A bad supporting file cannot erase a successful logfile load. An uploaded replacement is assigned only after its parser returns a valid non-empty result, so a failed replacement preserves the previous working data.
+
+The Expedition-events parser now:
+
+- Discovers its header rather than assuming the first row is the header.
+- Accepts repeated/reordered headers.
+- Checks field indexes before access.
+- Retains valid event rows while skipping short/malformed rows.
+- Avoids `Index for header 'Type' ... CSVRecord only has 1 values`.
+
+### Diagnostics
+
+`/api/state` now includes:
+
+- `loadStatus`
+- `loadWarnings`
+- `heapUsedMiB`
+- `heapMaxMiB`
+- `loadHeapLimitMiB`
+
+The loader logs accepted rows, invalid timestamps, malformed rows, skipped boat rows, header-section count, memory state, and up to five rejected timestamp examples when no row is valid.
+
+## Memory configuration for the 8 GB workspace
+
+The included Dockerfile uses:
 
 ```text
 JAVA_TOOL_OPTIONS=-Xms256m -Xmx4096m -Xss512k -XX:+UseG1GC -XX:MaxDirectMemorySize=256m -XX:MaxMetaspaceSize=256m -XX:+ExitOnOutOfMemoryError
 NIGHTJAR_LOAD_HEAP_LIMIT_MB=3200
 ```
 
-These settings are intentionally conservative for an 8 GB workspace. A 4 GiB Java heap, a 3.125 GiB loader guard, plus bounded direct memory and metaspace normally leaves more than 1 GiB below the requested 6 GB process target for JVM native memory, code cache, threads and short-lived operating overhead.
+The loader reads the logfile through a 1 MiB buffer. The 3,200 MiB load guard leaves room inside the 4 GiB heap for sorting and calculations, while the 4 GiB heap and bounded native areas give substantial headroom beneath the desired 6 GB process ceiling.
 
-Use this custom start command:
+If the guard is reached, useful rows are retained and clearly labelled as a partial load.
+
+## Railway
+
+Custom start command:
 
 ```bash
 java -jar /app/app.jar
 ```
 
-`JAVA_TOOL_OPTIONS` is read by Java automatically, so the custom command does not need `$JAVA_OPTS` expansion.
+The JVM automatically reads `JAVA_TOOL_OPTIONS`.
 
-## Expected log messages
+## Validate before merging
 
-A successful load reports messages such as:
-
-```text
-Loading /Data/logfile.csv sequentially (... bytes)
-Sequential log load: 250,000 rows; heap 420 / 3,200 MiB
-Loaded 1,250,000 rows sequentially; heap 1,840 MiB
-```
-
-If the configured guard is reached, the application remains online and reports:
-
-```text
-Log loading stopped safely ... because heap reached ... MiB
-```
-
-## Important limitation
-
-This patch makes parsing sequential and substantially reduces retained row overhead, but it still keeps the final parsed dataset in RAM because the current analysis APIs expect an in-memory dataset. If the compact final dataset itself exceeds the guarded heap threshold, it cannot be loaded in full under this design. The next architectural step would be a disk-backed columnar or embedded-database store.
-
-Also note that `/api/data` currently materialises the complete filtered response as maps before JSON serialisation. A very broad filter can therefore create a separate memory spike after loading. Keep an event/date filter active for very large logs, or change that endpoint to stream JSON in a later patch.
-
-## Build and test
+From the repository root:
 
 ```bash
 mvn clean test package
-docker build -t nightjar-090 .
-docker run --rm -p 8080:8080 -v /your/data:/Data nightjar-090
 ```
 
-Monitor the process while loading:
+Or build the same Docker image used by Railway:
 
 ```bash
-docker stats
+docker build -t nightjar-090 .
+docker run --rm -p 8080:8080 -v /local/path/to/Data:/Data nightjar-090
 ```
 
-The Java heap ceiling is 4 GiB. Total container memory is expected to remain below 6 GB with the supplied native-memory bounds, but RSS should still be verified with the real logfile because JVM/native behaviour and concurrent requests vary by deployment environment.
+Expected startup logging resembles:
+
+```text
+Loading /Data/logfile.csv sequentially (... bytes)
+Sequential log load: 250,000 valid rows; 2 invalid timestamps; heap 410 / 3,200 MiB
+Loaded 730,000 valid rows sequentially; heap 1,450 MiB. seen=..., accepted=..., schema sections=...
+Expedition events loaded from /Data/EventData.csv
+Tomcat started on port 8080
+```
+
+A small number of rejected rows should be reported as warnings without changing the valid row count to zero.
+
+## Remaining consideration
+
+The `/api/data` endpoint in the current 0.9.0 architecture constructs the complete filtered JSON response in memory. The loader is now bounded and resilient, but returning an unfiltered multi-million-row dataset can still create a separate server/browser memory peak. Event/date filtering remains advisable until that endpoint is converted to pagination or streaming.
