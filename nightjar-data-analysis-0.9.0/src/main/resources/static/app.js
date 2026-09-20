@@ -27,4 +27,13 @@ const axis=(row,v)=>v==="__TIME__"?row[NJ.state.mapping.timestamp]:row[v];functi
 
 async function save(){const mapping={};document.querySelectorAll(".map").forEach(e=>mapping[e.dataset.key]=e.value||null);const body={includedVariables:[...document.querySelectorAll(".var:checked")].map(e=>e.value),mapping,plotDownsamplingEnabled:$("downsample").checked,maxPlotPoints:Number($("maxPoints").value)};try{NJ.state=await post("/api/settings",body);configure();await refresh();msg("Settings saved.");}catch(e){msg(e.message);}}
 async function exportCsv(){try{const r=await fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(request())});if(!r.ok)throw new Error("Export failed");const a=document.createElement("a");a.href=URL.createObjectURL(await r.blob());a.download="nightjar_filtered_log_0.9.0.csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000);}catch(e){msg(e.message);}}
-document.addEventListener("DOMContentLoaded",()=>{$("signIn").onclick=async()=>{try{await post("/api/login",{password:$("password").value});show(true);await state();}catch(e){msg(e.message)}};$("logout").onclick=async()=>{await api("/api/logout",{method:"POST"});location.reload()};$("upload").onsubmit=async e=>{e.preventDefault();try{NJ.state=await api("/api/upload",{method:"POST",body:new FormData(e.target)});configure();await refresh();}catch(x){msg(x.message)}};$("apply").onclick=refresh;$("save").onclick=save;$("all").onclick=()=>document.querySelectorAll(".var").forEach(e=>e.checked=true);$("none").onclick=()=>document.querySelectorAll(".var").forEach(e=>e.checked=false);$("downsample").onchange=()=>$("maxPoints").disabled=!$("downsample").checked;$("csv").onclick=exportCsv;$("session").onclick=()=>location.href="/api/session";["polarTws","polarTol"].forEach(id=>$(id).onchange=polar);["gpsColour"].forEach(id=>$(id).onchange=gps);["varX","varY","varColour","varKind"].forEach(id=>$(id).onchange=variable);$("tabs").onclick=e=>{const b=e.target.closest(".tab");if(!b)return;document.querySelectorAll(".tab,.page").forEach(x=>x.classList.remove("active"));b.classList.add("active");$("page-"+b.dataset.page).classList.add("active");window.dispatchEvent(new Event("resize"));};boot().catch(e=>msg(e.message));});
+function initialise() {
+    ...
+    boot().catch(e => msg(e.message));
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initialise);
+} else {
+    initialise();
+}
