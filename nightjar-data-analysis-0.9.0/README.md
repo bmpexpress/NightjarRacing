@@ -1,75 +1,84 @@
-# Nightjar Data Analysis 0.9.0
+# Nightjar 0.9.0 — sequential logfile loader patch
 
-A Java/Spring Boot rebuild of the Nightjar sailing-data analysis web app. The browser UI is normal HTML/CSS/JavaScript; Java provides file parsing, filtering, UTC/BST handling, settings, downloads and data APIs.
+This patch replaces the memory-heavy logfile path in the Java 0.9.0 project.
 
-## Implemented in 0.9.0
+## Replace these files
 
-- Version uplift to **0.9.0** throughout the application and downloads.
-- Replaced Streamlit/Python deployment with **Java 21 + Spring Boot** and a standard static web front end.
-- Treats Expedition GUN timestamps as **UTC** and converts them with `Europe/London` zone rules before applying the GUN-minus-five-minutes crop. This applies BST (+01:00) only when in force and GMT (+00:00) otherwise.
-- Nightjar navy/orange design applied consistently to controls, panels, charts and states.
-- Persistent orange divider under the top analysis tabs.
-- Settings tab lists every channel. Unticked channels are removed from API responses, calculations, selectors, tables and charts.
-- Variable plot supports **Time** on either Cartesian axis. Selecting Time while Polar is selected automatically uses Cartesian mode.
-- Variation-filter defaults changed from 99 to **1**.
-- Times are rounded to the nearest second in charts, GPS hover text, tables and summaries.
-- Removed deterministic downsampling, maximum-point limits, DataFrame memory budgets and download-size limits. The full filtered selection is returned and plotted.
-- Standard and sparse Expedition logs, polar files, event files, event lists, sail-chart XML and text/DOCX debrief notes are supported.
-- Full-resolution CSV and JSON session downloads.
-- Optional startup loading from `/Data` (or `NIGHTJAR_DATA_DIR`) using the previous filenames.
+Copy the files in this archive over the same paths in the existing Java project:
 
-## Run locally
+- `src/main/java/com/nightjar/analysis/DataStore.java`
+- `src/main/java/com/nightjar/analysis/Models.java`
+- `src/main/resources/application.properties`
+- `Dockerfile`
+- `railway.toml`
 
-Requirements: Java 21 and Maven 3.9+.
+Do not replace `WebController.java`, `NightjarApplication.java` or the static website files.
 
-```bash
-mvn spring-boot:run
+## What changed
+
+1. `logfile.csv` is opened as a buffered `InputStream` and parsed record by record.
+2. Uploads use `MultipartFile.getInputStream()` instead of `getBytes()`.
+3. The loader no longer creates a whole-file byte array and a second whole-file Java String.
+4. Per-row `LinkedHashMap` storage is replaced with compact parallel key/value arrays. Blank sparse channels allocate nothing.
+5. New data are committed only after a complete successful parse; a failed replacement does not destroy a working dataset.
+6. Heap is checked every 2,048 accepted rows, with progress reported approximately every 250,000 rows.
+7. At the default 3,200 MiB loading threshold, loading stops cleanly before the 4 GiB heap is exhausted.
+8. A guarded startup failure leaves the web server online rather than creating a Railway restart loop.
+9. `/api/state` reports `heapUsedMiB`, `heapMaxMiB`, `loadHeapLimitMiB` and `loadStatus`.
+
+## Railway variables
+
+The Dockerfile defaults are:
+
+```text
+JAVA_TOOL_OPTIONS=-Xms256m -Xmx4096m -Xss512k -XX:+UseG1GC -XX:MaxDirectMemorySize=256m -XX:MaxMetaspaceSize=256m -XX:+ExitOnOutOfMemoryError
+NIGHTJAR_LOAD_HEAP_LIMIT_MB=3200
 ```
 
-Open `http://localhost:8080`.
+These settings are intentionally conservative for an 8 GB workspace. A 4 GiB Java heap, a 3.125 GiB loader guard, plus bounded direct memory and metaspace normally leaves more than 1 GiB below the requested 6 GB process target for JVM native memory, code cache, threads and short-lived operating overhead.
 
-Optional password:
+Use this custom start command:
 
 ```bash
-export NIGHTJAR_APP_PASSWORD='choose-a-strong-password'
-mvn spring-boot:run
+java -jar /app/app.jar
 ```
 
-Without `NIGHTJAR_APP_PASSWORD`, the app opens without a sign-in gate.
+`JAVA_TOOL_OPTIONS` is read by Java automatically, so the custom command does not need `$JAVA_OPTS` expansion.
 
-## Build
+## Expected log messages
+
+A successful load reports messages such as:
+
+```text
+Loading /Data/logfile.csv sequentially (... bytes)
+Sequential log load: 250,000 rows; heap 420 / 3,200 MiB
+Loaded 1,250,000 rows sequentially; heap 1,840 MiB
+```
+
+If the configured guard is reached, the application remains online and reports:
+
+```text
+Log loading stopped safely ... because heap reached ... MiB
+```
+
+## Important limitation
+
+This patch makes parsing sequential and substantially reduces retained row overhead, but it still keeps the final parsed dataset in RAM because the current analysis APIs expect an in-memory dataset. If the compact final dataset itself exceeds the guarded heap threshold, it cannot be loaded in full under this design. The next architectural step would be a disk-backed columnar or embedded-database store.
+
+Also note that `/api/data` currently materialises the complete filtered response as maps before JSON serialisation. A very broad filter can therefore create a separate memory spike after loading. Keep an event/date filter active for very large logs, or change that endpoint to stream JSON in a later patch.
+
+## Build and test
 
 ```bash
 mvn clean test package
-java -jar target/nightjar-data-analysis-0.9.0.jar
+docker build -t nightjar-090 .
+docker run --rm -p 8080:8080 -v /your/data:/Data nightjar-090
 ```
 
-## Docker / Railway
+Monitor the process while loading:
 
-The included `Dockerfile` uses a Maven build stage and Java 21 runtime. It honours Railway's `PORT` environment variable. Deploy the repository as a Dockerfile service and optionally attach a volume mounted at `/Data`.
+```bash
+docker stats
+```
 
-Recommended variables:
-
-- `NIGHTJAR_APP_PASSWORD_SHA256`: recommended SHA-256 password digest.
-- `NIGHTJAR_APP_PASSWORD`: optional plain application password when a digest is not supplied.
-- `NIGHTJAR_DATA_DIR`: optional default-data path; defaults to `/Data`.
-- `JAVA_OPTS`: JVM settings such as `-Xms512m -Xmx4g -XX:+UseG1GC`.
-
-No application-level memory ceiling is imposed. Set the deployment JVM heap to fit the largest complete log plus browser/API serialisation overhead.
-
-## Time-zone assumption
-
-The uploaded log timestamps are treated as UK local wall-clock times. Expedition event/GUN timestamps are treated as UTC. Java's IANA `Europe/London` rules produce the correct BST/GMT offset for the event date, including transition dates. The included unit tests check summer and winter behaviour.
-
-## Project structure
-
-- `src/main/java/.../DataStore.java` — parsers, derived VMG/VMG%, filters and BST handling.
-- `src/main/java/.../WebController.java` — upload, settings, data, export and session APIs.
-- `src/main/resources/static/index.html` — seven-page web interface.
-- `src/main/resources/static/app.js` — full-resolution plotting and UI calculations.
-- `src/main/resources/static/styles.css` — Nightjar styling.
-- `src/test/.../DataStoreTimeTest.java` — BST/GMT and timestamp-rounding tests.
-
-## Operational note
-
-Removing downsampling means very large selections are intentionally sent to the browser in full. This meets the requested behaviour but browser rendering and JSON transfer can become the next bottleneck even when server memory is ample. Use event/date filtering where interactive response matters; exports remain full resolution.
+The Java heap ceiling is 4 GiB. Total container memory is expected to remain below 6 GB with the supplied native-memory bounds, but RSS should still be verified with the real logfile because JVM/native behaviour and concurrent requests vary by deployment environment.
