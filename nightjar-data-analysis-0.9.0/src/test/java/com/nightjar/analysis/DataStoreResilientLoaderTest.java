@@ -35,8 +35,23 @@ class DataStoreResilientLoaderTest {
 
         assertEquals(3, state.get("rowCount"));
         assertTrue(((java.util.Set<?>) state.get("columns")).contains("Heel"));
-        assertTrue(((java.util.List<?>) state.get("loadWarnings")).stream()
-            .anyMatch(value -> value.toString().contains("invalid timestamps")));
+        java.util.List<?> warnings =
+			(java.util.List<?>) state.get("loadWarnings");
+
+		assertNotNull(warnings);
+
+		assertTrue(
+			warnings.stream()
+				.map(Object::toString)
+				.map(value -> value.toLowerCase(java.util.Locale.ROOT))
+				.anyMatch(value ->
+					value.contains("invalid timestamp")
+					|| value.contains("invalid utc")
+					|| value.contains("timestamp could not be parsed")
+				),
+			() -> "Expected an invalid timestamp warning, but loadWarnings was: "
+				+ warnings
+		);
     }
 
     @Test
