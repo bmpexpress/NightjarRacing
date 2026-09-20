@@ -1,0 +1,193 @@
+package com.nightjar.analysis;
+
+import jakarta.annotation.PostConstruct;
+import org.apache.commons.csv.*;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+import org.w3c.dom.*;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.time.*;
+import java.time.format.*;
+import java.time.temporal.*;
+import java.util.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
+
+@Service
+public class DataStore {
+ private static final long MIB=1024L*1024L, DEFAULT_LOAD_HEAP_LIMIT_MB=3200L, HEAP_RESERVE_MB=512L;
+ private static final int BUFFER=1024*1024, PROGRESS=250_000, MAX_SAMPLES=5;
+ private final ReentrantReadWriteLock lock=new ReentrantReadWriteLock();
+ private List<Models.Row> rows=new ArrayList<>();
+ private List<Models.EventDefinition> eventList=new ArrayList<>();
+ private List<Models.ExpeditionEvent> expeditionEvents=new ArrayList<>();
+ private List<Models.PolarPoint> polar=new ArrayList<>();
+ private List<Models.SailPoint> sails=new ArrayList<>();
+ private String debrief="",loadStatus="No log loaded";
+ private LinkedHashSet<String> columns=new LinkedHashSet<>(),included=new LinkedHashSet<>();
+ private LinkedHashMap<String,String> mapping=new LinkedHashMap<>();
+ private final List<String> loadWarnings=new ArrayList<>();
+ private boolean plotDownsamplingEnabled=true;
+ private int maxPlotPoints=10_000;
+ private static final ZoneId DATA_ZONE=ZoneId.of("Europe/London"),GUN_ZONE=ZoneOffset.UTC;
+ private static final Map<String,List<String>> ALIASES=Map.ofEntries(
+  Map.entry("timestamp",List.of("utc","time","timestamp","datetime")),Map.entry("bsp",List.of("bsp","boat speed","log bsp")),
+  Map.entry("twa",List.of("twa","true wind angle")),Map.entry("tws",List.of("tws","true wind speed")),
+  Map.entry("awa",List.of("awa","apparent wind angle")),Map.entry("aws",List.of("aws")),
+  Map.entry("vmg",List.of("vmg","velocity made good","vmg kt","vmg knots")),Map.entry("vmg_pct",List.of("vmg%","vmg %","vmg pct","vmg percent","vmg_pct")),
+  Map.entry("heel",List.of("heel")),Map.entry("drift",List.of("drift","tide rate")),
+  Map.entry("lat",List.of("lat","latitude","lat1")),Map.entry("lon",List.of("lon","longitude","lon1")),
+  Map.entry("sog",List.of("sog")),Map.entry("cog",List.of("cog")),Map.entry("sail",List.of("sail","foresail_id","foresail")));
+
+ private static final class Stats {
+  long seen,accepted,badTime,malformed,otherBoat; int schemas; boolean memoryPartial,parserPartial;
+  final List<String> badTimeSamples=new ArrayList<>();
+  String summary(){return String.format(Locale.ROOT,"seen=%,d, accepted=%,d, invalid timestamps=%,d, malformed=%,d, other boats=%,d, schema sections=%,d%s%s",seen,accepted,badTime,malformed,otherBoat,schemas,memoryPartial?", memory-limited partial load":"",parserPartial?", parser partial load":"");}
+ }
+ private record Parsed(List<Models.Row> rows,LinkedHashSet<String> columns,Stats stats){}
+ @FunctionalInterface private interface Action{void run()throws Exception;}
+
+ @PostConstruct void startup(){
+  Path dir=Path.of(System.getenv().getOrDefault("NIGHTJAR_DATA_DIR","/Data"));
+  lock.writeLock().lock();
+  try{
+   loadWarnings.clear();
+   Path log=dir.resolve("logfile.csv");
+   if(Files.exists(log))try(InputStream in=Files.newInputStream(log)){System.out.printf("Loading %s sequentially (%,d bytes)%n",log,Files.size(log));parseLog(in);}catch(Exception ex){warn("Logfile",ex);}
+   auxiliary("Polar",dir.resolve("Polar.txt"),()->polar=parsePolar(Files.readAllBytes(dir.resolve("Polar.txt"))));
+   auxiliary("Expedition events",dir.resolve("EventData.csv"),()->expeditionEvents=parseEvents(Files.readAllBytes(dir.resolve("EventData.csv"))));
+   auxiliary("Event list",dir.resolve("EventList.txt"),()->eventList=parseEventList(Files.readAllBytes(dir.resolve("EventList.txt"))));
+   auxiliary("Sail chart",dir.resolve("SailChart.xml"),()->sails=parseSails(Files.readAllBytes(dir.resolve("SailChart.xml"))));
+   try{addVmgPct();}catch(Exception ex){warn("VMG percentage",ex);}
+  }finally{lock.writeLock().unlock();}
+ }
+ private void auxiliary(String label,Path path,Action action){if(!Files.exists(path))return;try{action.run();System.out.println(label+" loaded");}catch(Exception ex){warn(label,ex);}}
+ private void warn(String label,Exception ex){String msg=label+" skipped: "+Objects.toString(ex.getMessage(),ex.getClass().getSimpleName());loadWarnings.add(msg);System.err.println(msg);}
+
+ public Map<String,Object> state(){lock.readLock().lock();try{
+  LinkedHashMap<String,Object> out=new LinkedHashMap<>();
+  out.put("version",NightjarApplication.VERSION);out.put("loaded",!rows.isEmpty());out.put("rowCount",rows.size());out.put("columns",columns);out.put("includedVariables",included);out.put("mapping",mapping);
+  out.put("eventList",eventList);out.put("polar",polar);out.put("sails",sails);out.put("debrief",debrief);out.put("loadStatus",loadStatus);out.put("loadWarnings",List.copyOf(loadWarnings));
+  out.put("plotDownsamplingEnabled",plotDownsamplingEnabled);out.put("maxPlotPoints",maxPlotPoints);
+  out.put("heapUsedMiB",usedHeap()/MIB);out.put("heapMaxMiB",Runtime.getRuntime().maxMemory()/MIB);out.put("loadHeapLimitMiB",loadLimit()/MIB);
+  out.put("dataTimeZone",DATA_ZONE.getId());out.put("gunTimeZone",GUN_ZONE.getId());
+  out.put("gunEvents",expeditionEvents.stream().filter(e->e.utcTime()!=null&&isGun(e)).map(e->Map.of("utc",e.utcTime(),"local",gunLocal(e.utcTime()),"type",Objects.toString(e.type(),""),"comment",Objects.toString(e.comment(),""))).toList());
+  return out;
+ }finally{lock.readLock().unlock();}}
+
+ public void upload(MultipartFile log,MultipartFile polarFile,MultipartFile events,MultipartFile eventListFile,MultipartFile sailChart,MultipartFile debriefFile){
+  lock.writeLock().lock();try{
+   loadWarnings.clear();
+   if(log!=null&&!log.isEmpty())try(InputStream in=log.getInputStream()){parseLog(in);}catch(Exception ex){warn("Uploaded logfile",ex);}
+   if(polarFile!=null&&!polarFile.isEmpty())safe("Uploaded polar",()->polar=parsePolar(polarFile.getBytes()));
+   if(events!=null&&!events.isEmpty())safe("Uploaded events",()->expeditionEvents=parseEvents(events.getBytes()));
+   if(eventListFile!=null&&!eventListFile.isEmpty())safe("Uploaded event list",()->eventList=parseEventList(eventListFile.getBytes()));
+   if(sailChart!=null&&!sailChart.isEmpty())safe("Uploaded sail chart",()->sails=parseSails(sailChart.getBytes()));
+   if(debriefFile!=null&&!debriefFile.isEmpty())safe("Uploaded debrief",()->debrief=parseDebrief(debriefFile));
+   try{addVmgPct();}catch(Exception ex){warn("VMG percentage",ex);}
+  }finally{lock.writeLock().unlock();}
+ }
+ private void safe(String label,Action a){try{a.run();}catch(Exception ex){warn(label,ex);}}
+ public void updateSettings(Models.SettingsRequest r){lock.writeLock().lock();try{
+  included=r.includedVariables()==null?new LinkedHashSet<>(columns):r.includedVariables().stream().filter(columns::contains).collect(Collectors.toCollection(LinkedHashSet::new));
+  if(r.mapping()!=null)r.mapping().forEach((k,v)->{if(v==null||v.isBlank()||columns.contains(v))mapping.put(k,v==null||v.isBlank()?null:v);});
+  if(r.plotDownsamplingEnabled()!=null)plotDownsamplingEnabled=r.plotDownsamplingEnabled();
+  if(r.maxPlotPoints()!=null)maxPlotPoints=Math.max(100,Math.min(2_000_000,r.maxPlotPoints()));
+ }finally{lock.writeLock().unlock();}}
+
+ public Models.DataResponse filtered(Models.FilterRequest req,boolean forPlot){lock.readLock().lock();try{
+  Set<String> visible=req.includedVariables()==null?new LinkedHashSet<>(included):req.includedVariables().stream().filter(included::contains).collect(Collectors.toCollection(LinkedHashSet::new));
+  Set<String> names=req.events()==null?Set.of():new HashSet<>(req.events());
+  Set<LocalDate> eventDays=eventList.stream().filter(e->names.contains(e.event())).map(Models.EventDefinition::date).collect(Collectors.toSet());
+  LocalDate from=date(req.fromDate()),to=date(req.toDate());LocalTime start=time(req.startTime(),LocalTime.MIN),end=time(req.endTime(),LocalTime.MAX.truncatedTo(ChronoUnit.SECONDS));
+  List<String>warnings=new ArrayList<>(loadWarnings);Map<LocalDate,LocalDateTime> guns=gunCutoffs(eventDays,warnings);String tsCol=mapping.get("timestamp");
+  int matched=0;for(Models.Row row:rows)if(matches(row,req,eventDays,from,to,start,end,guns))matched++;
+  boolean sampled=forPlot&&plotDownsamplingEnabled&&matched>maxPlotPoints;int wanted=sampled?maxPlotPoints:matched;
+  List<Map<String,Object>> result=new ArrayList<>(wanted);double step=sampled?(matched-1.0)/(wanted-1.0):1.0;int seen=0,next=0;
+  for(Models.Row row:rows){if(!matches(row,req,eventDays,from,to,start,end,guns))continue;if(!sampled||seen==next){result.add(row.toMap(visible,tsCol));if(sampled&&result.size()<wanted)next=(int)Math.round(result.size()*step);}seen++;}
+  return new Models.DataResponse(result,warnings,rows.size(),matched,result.size(),sampled,new LinkedHashMap<>(mapping));
+ }finally{lock.readLock().unlock();}}
+ private static boolean matches(Models.Row row,Models.FilterRequest req,Set<LocalDate> eventDays,LocalDate from,LocalDate to,LocalTime start,LocalTime end,Map<LocalDate,LocalDateTime> guns){
+  LocalDateTime ts=row.timestamp;if(ts==null)return false;LocalDate day=ts.toLocalDate();if(!eventDays.isEmpty()&&!eventDays.contains(day))return false;if(eventDays.isEmpty()&&((from!=null&&day.isBefore(from))||(to!=null&&day.isAfter(to))))return false;LocalDateTime cut=guns.get(day);if(cut!=null&&ts.isBefore(cut))return false;return !req.trimByTime()||(!ts.toLocalTime().isBefore(start)&&!ts.toLocalTime().isAfter(end));
+ }
+ private Map<LocalDate,LocalDateTime> gunCutoffs(Set<LocalDate> days,List<String>warnings){HashMap<LocalDate,LocalDateTime> out=new HashMap<>();for(LocalDate day:days){Optional<Models.ExpeditionEvent> gun=expeditionEvents.stream().filter(e->e.utcTime()!=null&&isGun(e)&&gunLocal(e.utcTime()).toLocalDate().equals(day)).min(Comparator.comparing(Models.ExpeditionEvent::utcTime));if(gun.isEmpty())warnings.add("No GUN found for "+day);else out.put(day,gunLocal(gun.get().utcTime()).minusMinutes(5));}return out;}
+ private static boolean isGun(Models.ExpeditionEvent e){return(Objects.toString(e.type(),"")+" "+Objects.toString(e.comment(),"")).toLowerCase(Locale.ROOT).contains("gun");}
+ static LocalDateTime gunLocal(LocalDateTime utc){return utc.atZone(GUN_ZONE).withZoneSameInstant(DATA_ZONE).toLocalDateTime();}
+
+ void parseLog(InputStream source)throws IOException{
+  BufferedInputStream in=source instanceof BufferedInputStream b?b:new BufferedInputStream(source,BUFFER);boolean sparse=isSparse(in);Parsed parsed=sparse?parseSparse(reader(in)):parseStandard(reader(in));
+  if(parsed.rows().isEmpty())throw new IllegalArgumentException("No valid rows remained. "+parsed.stats().summary()+" rejected timestamps="+parsed.stats().badTimeSamples);
+  LinkedHashMap<String,String> newMap=detect(parsed.columns());if(newMap.get("timestamp")==null)throw new IllegalArgumentException("No UTC/timestamp channel found");
+  if(!ordered(parsed.rows()))parsed.rows().sort(Comparator.comparing(r->r.timestamp));
+  rows=parsed.rows();columns=parsed.columns();mapping=newMap;included=new LinkedHashSet<>(columns);addVmg();
+  Stats st=parsed.stats();if(st.memoryPartial)loadWarnings.add("Log retained as a partial load because the memory guard was reached.");if(st.parserPartial)loadWarnings.add("Log retained up to an unrecoverable CSV record.");if(st.badTime>0||st.malformed>0)loadWarnings.add(String.format("Skipped %,d invalid-timestamp and %,d malformed rows.",st.badTime,st.malformed));
+  loadStatus=String.format("Loaded %,d valid rows sequentially; heap %,d MiB. %s",rows.size(),usedHeap()/MIB,st.summary());System.out.println(loadStatus);
+ }
+ private Parsed parseSparse(Reader source)throws IOException{
+  ArrayList<Models.Row> out=new ArrayList<>();LinkedHashSet<String> cols=new LinkedHashSet<>(List.of("Boat","Utc"));Stats st=new Stats();List<String> names=null;Map<String,String> ids=new HashMap<>();
+  try(CSVParser parser=CSVFormat.DEFAULT.builder().setTrim(true).setIgnoreEmptyLines(true).get().parse(source)){Iterator<CSVRecord> it=parser.iterator();while(true){CSVRecord r;try{if(!it.hasNext())break;r=it.next();}catch(RuntimeException ex){st.parserPartial=true;st.malformed++;break;}st.seen++;
+   try{if(r.size()==0)continue;String first=clean(r.get(0)),second=r.size()>1?clean(r.get(1)):"";
+    if(first.equalsIgnoreCase("!boat")&&second.equalsIgnoreCase("utc")){names=new ArrayList<>();for(String v:r)names.add(strip(v));ids.clear();st.schemas++;continue;}
+    if(first.equalsIgnoreCase("!boat")&&integer(second)){ids.clear();if(names==null){st.malformed++;continue;}int width=Math.min(names.size(),r.size());for(int i=0;i<width;i++){String id=clean(r.get(i)),channel=names.get(i);if(integer(id)&&!channel.isBlank()){ids.put(id,channel);cols.add(channel);}}continue;}
+    if(first.startsWith("!"))continue;if(r.size()<2){st.malformed++;continue;}if(!first.equals("0")){st.otherBoat++;continue;}
+    Object rawUtc=typed(second);LocalDateTime ts=parseDateTime(rawUtc);if(ts==null){rejectTime(st,second);continue;}
+    Models.Row row=new Models.Row(Math.max(8,r.size()/2+4));row.timestamp=ts;row.values.put("Boat",typed(first));row.values.put("Utc",rawUtc);
+    for(int i=2;i+1<r.size();i+=2){String channel=ids.get(clean(r.get(i)));if(channel!=null){Object value=typed(r.get(i+1));if(value!=null)row.values.put(channel,value);}}
+    if((r.size()-2)%2!=0)st.malformed++;out.add(row);st.accepted++;if(!budget(st))break;
+   }catch(RuntimeException ex){st.malformed++;}}
+  }return new Parsed(out,cols,st);
+ }
+ private Parsed parseStandard(Reader source)throws IOException{
+  ArrayList<Models.Row> out=new ArrayList<>();LinkedHashSet<String> cols=new LinkedHashSet<>();Stats st=new Stats();List<String> headers=null;int tsIndex=-1,boatIndex=-1;
+  try(CSVParser parser=CSVFormat.DEFAULT.builder().setTrim(true).setIgnoreEmptyLines(true).get().parse(source)){Iterator<CSVRecord> it=parser.iterator();while(true){CSVRecord r;try{if(!it.hasNext())break;r=it.next();}catch(RuntimeException ex){st.parserPartial=true;st.malformed++;break;}st.seen++;
+   try{List<String> possible=header(r);if(!possible.isEmpty()){headers=possible;cols.addAll(headers);tsIndex=headers.indexOf(detect(new LinkedHashSet<>(headers)).get("timestamp"));boatIndex=indexIgnoreCase(headers,"Boat");st.schemas++;continue;}if(headers==null)continue;if(boatIndex>=0&&boatIndex<r.size()&&!clean(r.get(boatIndex)).equals("0")){st.otherBoat++;continue;}if(tsIndex<0||tsIndex>=r.size()){rejectTime(st,"<missing>");continue;}Object raw=typed(r.get(tsIndex));LocalDateTime ts=parseDateTime(raw);if(ts==null){rejectTime(st,r.get(tsIndex));continue;}Models.Row row=new Models.Row(headers.size()+2);row.timestamp=ts;for(int i=0;i<Math.min(headers.size(),r.size());i++){Object value=typed(r.get(i));if(value!=null)row.values.put(headers.get(i),value);}out.add(row);st.accepted++;if(!budget(st))break;
+   }catch(RuntimeException ex){st.malformed++;}}
+  }return new Parsed(out,cols,st);
+ }
+
+ private static List<String> header(CSVRecord r){ArrayList<String> h=new ArrayList<>();boolean ts=false;for(String value:r){String name=strip(value);h.add(name);String n=norm(name);if(Set.of("utc","time","timestamp","datetime").contains(n))ts=true;}return ts&&h.size()>=2?h:List.of();}
+ private static void rejectTime(Stats st,Object value){st.badTime++;if(st.badTimeSamples.size()<MAX_SAMPLES)st.badTimeSamples.add(Objects.toString(value,"<null>"));}
+ private static boolean budget(Stats st){if(st.accepted>0&&st.accepted%PROGRESS==0)System.out.printf("Sequential log load: %,d valid rows; %,d invalid timestamps; heap %,d / %,d MiB%n",st.accepted,st.badTime,usedHeap()/MIB,loadLimit()/MIB);if((st.accepted&2047L)!=0||usedHeap()<loadLimit())return true;st.memoryPartial=true;System.err.printf("Memory guard reached after %,d rows; valid rows retained.%n",st.accepted);return false;}
+ private static boolean isSparse(BufferedInputStream in)throws IOException{in.mark(4096);byte[] prefix=in.readNBytes(4096);in.reset();return new String(prefix,StandardCharsets.UTF_8).replace("\uFEFF","").stripLeading().startsWith("!");}
+ private static Reader reader(InputStream in)throws IOException{PushbackInputStream p=new PushbackInputStream(in,3);byte[] b=p.readNBytes(3);if(!(b.length==3&&(b[0]&255)==239&&(b[1]&255)==187&&(b[2]&255)==191))p.unread(b);return new BufferedReader(new InputStreamReader(p,StandardCharsets.UTF_8),BUFFER);}
+ private static boolean ordered(List<Models.Row> items){for(int i=1;i<items.size();i++)if(items.get(i).timestamp.isBefore(items.get(i-1).timestamp))return false;return true;}
+ private static long usedHeap(){Runtime r=Runtime.getRuntime();return r.totalMemory()-r.freeMemory();}
+ private static long loadLimit(){long configured;try{configured=Long.parseLong(System.getenv().getOrDefault("NIGHTJAR_LOAD_HEAP_LIMIT_MB",Long.toString(DEFAULT_LOAD_HEAP_LIMIT_MB)));}catch(NumberFormatException e){configured=DEFAULT_LOAD_HEAP_LIMIT_MB;}return Math.min(configured*MIB,Math.max(512*MIB,Runtime.getRuntime().maxMemory()-HEAP_RESERVE_MB*MIB));}
+ private static boolean integer(String value){return value!=null&&value.matches("[+-]?\\d+");}
+ private static String clean(String value){return value==null?"":value.trim();}
+ private static String strip(String value){return clean(value).replaceFirst("^!","").trim();}
+ private static int indexIgnoreCase(List<String> values,String target){for(int i=0;i<values.size();i++)if(values.get(i).equalsIgnoreCase(target))return i;return -1;}
+ private static LinkedHashMap<String,String> detect(Set<String> names){LinkedHashMap<String,String> out=new LinkedHashMap<>();Map<String,String> keys=names.stream().collect(Collectors.toMap(DataStore::norm,x->x,(a,b)->a,LinkedHashMap::new));ALIASES.forEach((key,aliases)->{String found=aliases.stream().map(DataStore::norm).map(keys::get).filter(Objects::nonNull).findFirst().orElse(null);if(found==null)found=names.stream().filter(name->aliases.stream().anyMatch(a->norm(name).startsWith(norm(a)))).findFirst().orElse(null);out.put(key,found);});if(out.get("vmg")!=null&&(out.get("vmg").contains("%")||norm(out.get("vmg")).contains("pct")))out.put("vmg",null);return out;}
+
+ private void addVmg(){String existing=mapping.get("vmg"),bsp=mapping.get("bsp"),twa=mapping.get("twa");if(existing!=null||bsp==null||twa==null)return;int count=0;for(Models.Row row:rows){Double speed=number(row.values.get(bsp)),angle=number(row.values.get(twa));if(speed!=null&&angle!=null){row.values.put("VMG",speed*Math.cos(Math.toRadians(signed(angle))));count++;}if(count>0&&(count&2047)==0&&usedHeap()>=loadLimit()){loadWarnings.add("VMG calculation stopped at memory guard; source rows retained.");break;}}if(count>0){columns.add("VMG");mapping.put("vmg","VMG");included.add("VMG");}}
+ private void addVmgPct(){if(rows.isEmpty()||polar.isEmpty())return;String pct=mapping.get("vmg_pct"),vmg=mapping.get("vmg"),tws=mapping.get("tws"),twa=mapping.get("twa");if(pct!=null||vmg==null||tws==null||twa==null)return;Map<Double,List<Models.PolarPoint>> curves=polar.stream().collect(Collectors.groupingBy(Models.PolarPoint::tws));double[] winds=curves.keySet().stream().mapToDouble(Double::doubleValue).sorted().toArray();int count=0;for(Models.Row row:rows){Double actual=number(row.values.get(vmg)),wind=number(row.values.get(tws)),angle=number(row.values.get(twa));Double target=wind==null||angle==null?null:target(curves,winds,wind,Math.abs(signed(angle)));double denominator=target==null?Double.NaN:Math.abs(target*Math.cos(Math.toRadians(Math.abs(signed(angle)))));if(actual!=null&&Double.isFinite(denominator)&&denominator>=.05){row.values.put("VMG_PCT",Math.abs(actual)/denominator*100);count++;}if(count>0&&(count&2047)==0&&usedHeap()>=loadLimit()){loadWarnings.add("VMG% calculation stopped at memory guard; source rows retained.");break;}}if(count>0){columns.add("VMG_PCT");mapping.put("vmg_pct","VMG_PCT");included.add("VMG_PCT");}}
+ private static Double target(Map<Double,List<Models.PolarPoint>> curves,double[] winds,double tws,double twa){if(winds.length==0||tws<winds[0]||tws>winds[winds.length-1])return null;int hi=Arrays.binarySearch(winds,tws);if(hi<0)hi=-hi-1;int lo=Math.max(0,hi-1);if(hi>=winds.length)hi=winds.length-1;Double low=angle(curves.get(winds[lo]),twa),high=angle(curves.get(winds[hi]),twa);if(low==null||high==null)return null;if(lo==hi)return low;double w=(tws-winds[lo])/(winds[hi]-winds[lo]);return low+w*(high-low);}
+ private static Double angle(List<Models.PolarPoint> points,double twa){List<Models.PolarPoint> p=points.stream().sorted(Comparator.comparingDouble(Models.PolarPoint::twa)).toList();if(p.isEmpty()||twa<p.get(0).twa()||twa>p.get(p.size()-1).twa())return null;for(int i=0;i<p.size();i++){if(Math.abs(p.get(i).twa()-twa)<1e-9)return p.get(i).targetBsp();if(p.get(i).twa()>twa){Models.PolarPoint a=p.get(i-1),b=p.get(i);double w=(twa-a.twa())/(b.twa()-a.twa());return a.targetBsp()+w*(b.targetBsp()-a.targetBsp());}}return p.get(p.size()-1).targetBsp();}
+ private static double signed(double a){return((a+180)%360+360)%360-180;}
+
+ private static List<Models.PolarPoint> parsePolar(byte[] raw){ArrayList<Models.PolarPoint> out=new ArrayList<>();for(String line:decode(raw).split("\\R")){line=line.trim();if(line.isEmpty()||line.startsWith("!")||line.startsWith("#"))continue;try{double[] v=Arrays.stream(line.split("[\\t,; ]+")).filter(x->!x.isBlank()).mapToDouble(Double::parseDouble).toArray();for(int i=1;i+1<v.length;i+=2)if(v[i]>=0&&v[i]<=180&&v[i+1]>=0)out.add(new Models.PolarPoint(v[0],v[i],v[i+1]));}catch(RuntimeException ignored){}}if(out.isEmpty())throw new IllegalArgumentException("No valid polar points");return out;}
+ private static List<Models.ExpeditionEvent> parseEvents(byte[] raw)throws IOException{ArrayList<Models.ExpeditionEvent>out=new ArrayList<>();Map<String,Integer> h=new HashMap<>();try(CSVParser parser=CSVFormat.DEFAULT.builder().setTrim(true).setIgnoreEmptyLines(true).get().parse(new StringReader(decode(raw)))){for(CSVRecord r:parser){Map<String,Integer> candidate=eventHeader(r);if(!candidate.isEmpty()){h=candidate;continue;}if(h.isEmpty())continue;String t=field(r,h,"time","utc","timestamp","datetime");LocalDateTime dt=parseDateTime(typed(t));if(dt==null)continue;out.add(new Models.ExpeditionEvent(dt,field(r,h,"type","event type"),field(r,h,"comment","event","description")));}}if(out.isEmpty())throw new IllegalArgumentException("No valid event rows");return out;}
+ private static Map<String,Integer> eventHeader(CSVRecord r){HashMap<String,Integer> h=new HashMap<>();for(int i=0;i<r.size();i++){String n=norm(strip(r.get(i)));if(!n.isBlank())h.put(n,i);}boolean time=List.of("time","utc","timestamp","datetime").stream().anyMatch(h::containsKey),content=List.of("type","event type","comment","event","description").stream().anyMatch(h::containsKey);return time&&content?h:Map.of();}
+ private static String field(CSVRecord r,Map<String,Integer>h,String...names){for(String name:names){Integer i=h.get(name);if(i!=null&&i>=0&&i<r.size())return clean(r.get(i));}return"";}
+ private static List<Models.EventDefinition> parseEventList(byte[] raw){ArrayList<Models.EventDefinition>out=new ArrayList<>();for(String line:decode(raw).split("\\R")){if(line.isBlank()||line.stripLeading().startsWith("!"))continue;String[] p=line.split(",",3);if(p.length<3)continue;try{out.add(new Models.EventDefinition(LocalDate.parse(unquote(p[0].trim()),DateTimeFormatter.BASIC_ISO_DATE),unquote(p[1].trim()),unquote(p[2].trim())));}catch(RuntimeException ignored){}}if(out.isEmpty())throw new IllegalArgumentException("No valid event-list rows");return out;}
+ private static List<Models.SailPoint> parseSails(byte[] raw)throws Exception{ArrayList<Models.SailPoint>out=new ArrayList<>();DocumentBuilderFactory factory=DocumentBuilderFactory.newInstance();try{factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl",true);}catch(Exception ignored){}Document doc=factory.newDocumentBuilder().parse(new ByteArrayInputStream(raw));NodeList es=doc.getElementsByTagName("element");for(int i=0;i<es.getLength();i++){try{Element e=(Element)es.item(i);if(!"Sail".equals(e.getAttribute("type")))continue;String colour="#ffffff";double opacity=.4,width=3;NodeList cs=e.getElementsByTagName("colour");if(cs.getLength()>0){Element c=(Element)cs.item(0);colour=String.format("#%02x%02x%02x",attrInt(c,"r",255),attrInt(c,"g",255),attrInt(c,"b",255));}NodeList os=e.getElementsByTagName("shapeopacity");if(os.getLength()>0)opacity=attrDouble((Element)os.item(0),"val",40)/100;NodeList ws=e.getElementsByTagName("linewidth");if(ws.getLength()>0)width=attrDouble((Element)ws.item(0),"val",3);NodeList ps=e.getElementsByTagName("point");for(int j=0;j<ps.getLength();j++){Element q=(Element)ps.item(j);out.add(new Models.SailPoint(e.getAttribute("name"),j+1,attrDouble(q,"tws",0),attrDouble(q,"twa",0),colour,opacity,width));}}catch(RuntimeException ignored){}}if(out.isEmpty())throw new IllegalArgumentException("No valid sail points");return out;}
+ private static String parseDebrief(MultipartFile file)throws Exception{if(file.getOriginalFilename()!=null&&file.getOriginalFilename().toLowerCase(Locale.ROOT).endsWith(".docx")){try(XWPFDocument doc=new XWPFDocument(file.getInputStream())){return doc.getParagraphs().stream().map(x->x.getText()).filter(x->!x.isBlank()).collect(Collectors.joining("\n\n"));}}return decode(file.getBytes());}
+
+ private static Object typed(String raw){if(raw==null||raw.isBlank())return null;String v=raw.trim();try{double d=Double.parseDouble(v);return Double.isFinite(d)?d:null;}catch(NumberFormatException e){return v;}}
+ private static Double number(Object value){return value instanceof Number n?n.doubleValue():null;}
+ static LocalDateTime parseDateTime(Object input){if(input==null)return null;if(input instanceof Number n)return excel(n.doubleValue());String text=input.toString().trim();if(text.isEmpty())return null;try{double serial=Double.parseDouble(text);if(Double.isFinite(serial)&&serial>=0&&serial<=100_000)return excel(serial);}catch(NumberFormatException ignored){}List<DateTimeFormatter> formats=List.of(DateTimeFormatter.ISO_LOCAL_DATE_TIME,flex("d/M/uuuu"),flex("d-M-uuuu"),flex("uuuu-M-d"));for(DateTimeFormatter f:formats)try{return round(LocalDateTime.parse(text,f));}catch(DateTimeParseException ignored){}try{return round(OffsetDateTime.parse(text).toLocalDateTime());}catch(DateTimeParseException ignored){return null;}}
+ private static DateTimeFormatter flex(String date){return new DateTimeFormatterBuilder().parseCaseInsensitive().appendPattern(date+" H:mm[:ss]").optionalStart().appendFraction(ChronoField.NANO_OF_SECOND,0,9,true).optionalEnd().toFormatter(Locale.UK);}
+ private static LocalDateTime excel(double days){if(!Double.isFinite(days)||days<0||days>100_000)return null;return LocalDateTime.of(1899,12,30,0,0).plusSeconds(Math.round(days*86_400));}
+ private static LocalDateTime round(LocalDateTime value){return value.plusNanos(500_000_000).truncatedTo(ChronoUnit.SECONDS);}
+ private static String decode(byte[] raw){return new String(raw,StandardCharsets.UTF_8).replace("\uFEFF","");}
+ private static String norm(String v){return v==null?"":v.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+"," ").trim();}
+ private static String unquote(String v){return v.replaceAll("^\\\"|\\\"$","");}
+ private static int attrInt(Element e,String n,int d){try{return Integer.parseInt(e.getAttribute(n));}catch(Exception x){return d;}}
+ private static double attrDouble(Element e,String n,double d){try{return Double.parseDouble(e.getAttribute(n));}catch(Exception x){return d;}}
+ private static LocalDate date(String s){try{return s==null||s.isBlank()?null:LocalDate.parse(s);}catch(Exception e){return null;}}
+ private static LocalTime time(String s,LocalTime fallback){try{return s==null||s.isBlank()?fallback:LocalTime.parse(s);}catch(Exception e){return fallback;}}
+}
