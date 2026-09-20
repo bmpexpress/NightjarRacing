@@ -296,7 +296,7 @@ public class DataStore {
 
     private static List<Models.PolarPoint> parsePolar(byte[] raw) {
         ArrayList<Models.PolarPoint> out = new ArrayList<>();
-        for (String line : decode(raw).split("\|R")) {
+        for (String line : decode(raw).split("\\R")) {
             line = line.trim(); if (line.isEmpty() || line.startsWith("!") || line.startsWith("#")) continue;
             try {
                 double[] values = Arrays.stream(line.split("[\t,; ]+")).filter(s -> !s.isBlank()).mapToDouble(Double::parseDouble).toArray();
