@@ -943,11 +943,18 @@ public class DataStore {
             .toFormatter(Locale.UK);
     }
 
-    private static LocalDateTime excelSerialToDateTime(double serialDays) {
-        if (!Double.isFinite(serialDays) || serialDays < 1.0 || serialDays > 100_000.0) return null;
-        long seconds = Math.round(serialDays * 86_400.0);
-        return LocalDateTime.of(1899,12,30,0,0).plusSeconds(seconds);
-    }
+	private static LocalDateTime excelSerialToDateTime(double serialDays) {
+		if (!Double.isFinite(serialDays)
+				|| serialDays < 0.0
+				|| serialDays > 100_000.0) {
+			return null;
+		}
+
+		long seconds = Math.round(serialDays * 86400.0);
+
+		return LocalDateTime.of(1899, 12, 30, 0, 0)
+				.plusSeconds(seconds);
+	}
 
     private static LocalDateTime roundToSecond(LocalDateTime value) {
         return value.plusNanos(500_000_000L).truncatedTo(ChronoUnit.SECONDS);
