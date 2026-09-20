@@ -217,9 +217,9 @@ public class DataStore {
                 if ("!boat".equalsIgnoreCase(first) && "utc".equalsIgnoreCase(second)) {
                     names = new ArrayList<>(); rec.forEach(names::add); lookup.clear(); continue;
                 }
-                if ("!boat".equalsIgnoreCase(first) && second.matches("[+-]?\d+")) {
+                if ("!boat".equalsIgnoreCase(first) && second.matches("[+-]?\\d+")) {
                     if (names != null && names.size() == rec.size()) {
-                        for (int i=0;i<rec.size();i++) if (rec.get(i).trim().matches("[+-]?\d+"))
+                        for (int i=0;i<rec.size();i++) if (rec.get(i).trim().matches("[+-]?\\d+"))
                             lookup.put(rec.get(i).trim(), names.get(i).replaceFirst("^!", "").trim());
                     }
                     continue;
@@ -296,7 +296,7 @@ public class DataStore {
 
     private static List<Models.PolarPoint> parsePolar(byte[] raw) {
         ArrayList<Models.PolarPoint> out = new ArrayList<>();
-        for (String line : decode(raw).split("\R")) {
+        for (String line : decode(raw).split("\|R")) {
             line = line.trim(); if (line.isEmpty() || line.startsWith("!") || line.startsWith("#")) continue;
             try {
                 double[] values = Arrays.stream(line.split("[\t,; ]+")).filter(s -> !s.isBlank()).mapToDouble(Double::parseDouble).toArray();
@@ -309,7 +309,7 @@ public class DataStore {
 
     private static List<Models.EventDefinition> parseEventList(byte[] raw) {
         ArrayList<Models.EventDefinition> out = new ArrayList<>();
-        for (String line : decode(raw).split("\R")) {
+        for (String line : decode(raw).split("\\R")) {
             String[] p = line.split(",", 3); if (p.length < 3) continue;
             try { out.add(new Models.EventDefinition(LocalDate.parse(unquote(p[0].trim()), DateTimeFormatter.BASIC_ISO_DATE), unquote(p[1].trim()), unquote(p[2].trim()))); }
             catch (DateTimeParseException ignored) {}

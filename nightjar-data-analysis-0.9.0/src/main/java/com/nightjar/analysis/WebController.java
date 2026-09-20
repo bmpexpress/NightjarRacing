@@ -80,5 +80,8 @@ public class WebController {
         try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))); }
         catch (Exception ex) { throw new IllegalStateException("SHA-256 is unavailable", ex); }
     }
-    private static String quote(String s){String x=s.replace(""","""");return """+x+""";}
+    private static String quote(String s) {
+		String x = s.replace("\"", "\"\"");
+		return "\"" + x + "\"";
+	}
 }
