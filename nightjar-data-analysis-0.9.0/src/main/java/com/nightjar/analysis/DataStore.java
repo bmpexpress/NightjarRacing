@@ -17,6 +17,8 @@ import java.util.*;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
+import com.nightjar.analysis.EventDataParser;
+
 @Service
 public class DataStore {
     private static final long MIB = 1024L * 1024L;
@@ -358,10 +360,8 @@ public class DataStore {
             LocalDate.parse(unquote(p[0].trim()),DateTimeFormatter.BASIC_ISO_DATE),unquote(p[1].trim()),unquote(p[2].trim())));}catch(DateTimeParseException ignored){}}
         return out;
     }
-    private static List<Models.ExpeditionEvent> parseEvents(byte[] raw)throws IOException{
-        ArrayList<Models.ExpeditionEvent> out=new ArrayList<>();CSVFormat format=CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).get();
-        try(CSVParser parser=format.parse(new StringReader(decode(raw)))){for(CSVRecord rec:parser)out.add(new Models.ExpeditionEvent(
-            parseDateTime(rec.isMapped("Time")?rec.get("Time"):null),rec.isMapped("Type")?rec.get("Type"):"",rec.isMapped("Comment")?rec.get("Comment"):""));}return out;
+    private static List<Models.ExpeditionEvent> parseEvents(byte[] raw) throws IOException {
+        return EventDataParser.parse(raw).events();
     }
     private static List<Models.SailPoint> parseSails(byte[] raw)throws Exception{
         ArrayList<Models.SailPoint> out=new ArrayList<>();Document doc=DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(new ByteArrayInputStream(raw));
