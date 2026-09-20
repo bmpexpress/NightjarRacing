@@ -4,7 +4,6 @@ COPY pom.xml .
 RUN mvn -B -q dependency:go-offline
 COPY src src
 RUN mvn -B -q test package
-
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY --from=build /workspace/target/nightjar-data-analysis-0.9.0.jar app.jar
