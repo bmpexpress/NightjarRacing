@@ -1,0 +1,1 @@
+import{S}from"./state.js";import{$}from"./common.js";export function render(){Plotly.react("variablePlot",[{x:S.rows.map(r=>r[$("varX").value]),y:S.rows.map(r=>r[$("varY").value]),type:"scatter",mode:"markers"}],{paper_bgcolor:"transparent",plot_bgcolor:"transparent"})}

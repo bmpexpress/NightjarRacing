@@ -1,0 +1,1 @@
+import{S}from"./state.js";import{post}from"./api.js";import{$}from"./common.js";export async function save(){S.server=await post("/api/settings",{includedVariables:S.server.includedVariables,mapping:S.server.mapping,plotDownsamplingEnabled:$("downsample").checked,maxPlotPoints:+$("maxPoints").value})}

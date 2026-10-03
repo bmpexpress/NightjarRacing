@@ -1,0 +1,1 @@
+import{post}from"./api.js";import{$,req,table}from"./common.js";export async function load(){try{$("fileStatus").textContent="Loading…";const s=$("fileSource").value,d=await post(`/api/file-data/${s}`,req());table("fileTable",d.rows||[]);$("fileStatus").textContent=`Showing ${(d.rows||[]).length.toLocaleString()} rows`}catch(e){$("fileStatus").textContent=e.message}}
