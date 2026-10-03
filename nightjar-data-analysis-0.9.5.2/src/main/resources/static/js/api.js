@@ -1,0 +1,1 @@
+export async function api(url,opt={}){const r=await fetch(url,{credentials:"same-origin",...opt}),t=r.headers.get("content-type")||"",b=t.includes("json")?await r.json():r;if(!r.ok)throw Error(b?.error||r.statusText);return b}export const post=(u,b)=>api(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});

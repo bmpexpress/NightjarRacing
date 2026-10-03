@@ -1,0 +1,2 @@
+# Nightjar Data Analysis 0.9.5.2
+This is an overlay for the working 0.9.4 project. Copy the folder contents over a copy of 0.9.4 and retain the existing DataStore.java, Models.java, application.properties, deployment files and Logo.png. The 0.9.4 layout and controls are preserved, while index.html is reduced to a shell and each page and JavaScript responsibility is split into the requested folders.
