@@ -1,0 +1,1 @@
+import{NJ}from"./state.js";import{$,layout}from"./common.js";export function render(){const x=$("varX").value,y=$("varY").value;Plotly.react("variablePlot",[{x:NJ.rows.map(r=>r[x]),y:NJ.rows.map(r=>r[y]),type:"scatter",mode:"markers"}],layout(`${y} against ${x}`),{responsive:true})}export function bind(){["varX","varY","varColour","varKind"].forEach(id=>$(id).onchange=render)}
