@@ -1,0 +1,2 @@
+async function api(url,opt={}){const r=await fetch(url,{credentials:"same-origin",...opt}),t=r.headers.get("content-type")||"",b=t.includes("json")?await r.json():r;if(!r.ok)throw new Error(b?.error||r.statusText);return b}
+const post=(u,b)=>api(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}),num=v=>typeof v==="number"&&Number.isFinite(v),sel=e=>[...e.selectedOptions].map(o=>o.value),esc=v=>String(v??"").replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
