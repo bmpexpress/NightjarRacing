@@ -34,7 +34,7 @@ ALIASES = {
     "awa":["awa","apparent wind angle"],
     "aws":["aws"],
     "vmg":["vmg","velocity made good","vmg kt","vmg knots","vmg value","vmg kts"],
-    "vmg_pct":["vmg%","vmg %","vmg pc","vmg percent","vmg_pct"],
+    "vmg_pct":["vmg%","vmg %","vmg pc","vmg percent","vmg_pct","%vmg","polvmg%"],
     "heel":["heel"],
     "drift":["drift","tide rate"],
     "lat":["lat","latitude","lat1"],
