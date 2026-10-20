@@ -13,7 +13,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.8.0"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.10.0"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -169,22 +169,14 @@ def optimise_dtypes(df, categorise_text=False):
     return df
 
 
-def downsample_rows(df, max_points=10000):
-    """Return at most max_points rows, preserving row order by regular stepping."""
-    if df is None or df.empty:
-        return df
-    max_points = max(500, int(max_points or 10000))
-    if len(df) <= max_points:
-        return df
-    step = max(1, math.ceil(len(df) / max_points))
-    return df.iloc[::step].copy()
+
 
 
 def local_cache_path_for(path):
     p = Path(path)
     stat = p.stat()
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.stem)
-    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_080.parquet")
+    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_0100_full.parquet")
 
 
 @st.cache_data(show_spinner=False, max_entries=2)
@@ -208,11 +200,10 @@ def load_local_log_resource(path_string, file_size, modified_ns):
         try: return optimise_dtypes(pd.read_parquet(cache), categorise_text=True)
         except Exception: pass
     df = optimise_dtypes(parse_log(p))
-    # Arrow conversion can spike RAM, so only write modest caches by default.
-    max_cache_mb = float(os.environ.get("NIGHTJAR_PARQUET_CACHE_MAX_MB", "0"))
-    if dataframe_memory_mb(df) <= max_cache_mb:
-        try: df.to_parquet(cache, index=False, compression="zstd")
-        except Exception: pass
+    try:
+        df.to_parquet(cache, index=False, compression="zstd")
+    except (ImportError, OSError, ValueError, TypeError):
+        pass  # Parquet is an optional acceleration, never a prerequisite.
     gc.collect(); return df
 
 
@@ -342,84 +333,33 @@ def _rss_mb():
         return 0.0
 
 
-class _BoundedLogCollector:
-    """Collect sequential chunks and thin uniformly before RAM becomes unsafe.
-
-    The app's interactive views require a pandas DataFrame. When the complete
-    log cannot safely fit, retained records are deterministically decimated
-    across the whole timeline. This preserves date/time coverage while keeping
-    the resident process below the configured Railway memory ceiling.
-    """
+class _FullLogCollector:
+    """Collect every valid own-boat record; never thin data to meet a RAM budget."""
     def __init__(self):
-        self.limit_mb = float(os.environ.get("NIGHTJAR_MEMORY_LIMIT_MB", "750"))
-        self.frame_budget_mb = float(os.environ.get("NIGHTJAR_LOG_FRAME_BUDGET_MB", "140"))
-        self.headroom_mb = float(os.environ.get("NIGHTJAR_MEMORY_HEADROOM_MB", "180"))
         self.chunks = []
         self.input_rows = 0
-        self.stride = 1
-
-    def _stored_mb(self):
-        return sum(dataframe_memory_mb(c) for c in self.chunks)
-
-    def _thin_once(self):
-        thinned = []
-        for chunk in self.chunks:
-            if not chunk.empty:
-                smaller = chunk.iloc[::2].copy()
-                optimise_dtypes(smaller)
-                thinned.append(smaller)
-            del chunk
-        self.chunks = thinned
-        self.stride *= 2
-        gc.collect()
 
     def add(self, chunk):
         if chunk is None or chunk.empty:
             return
         chunk = _process_log_chunk(chunk)
-        source_rows = len(chunk)
-        if not source_rows:
-            return
-        start_row = self.input_rows
-        self.input_rows += source_rows
-        # Select against a global row number so chunk boundaries do not bias
-        # the retained timeline.
-        offset = (-start_row) % self.stride
-        kept = chunk.iloc[offset::self.stride].copy()
-        del chunk
-        if not kept.empty:
-            optimise_dtypes(kept)
-            self.chunks.append(kept)
-        while self.chunks and (
-            self._stored_mb() > self.frame_budget_mb
-            or (_rss_mb() and _rss_mb() > self.limit_mb - self.headroom_mb)
-        ):
-            self._thin_once()
+        if not chunk.empty:
+            self.input_rows += len(chunk)
+            self.chunks.append(chunk)
 
     def finish(self):
         if not self.chunks:
             raise ValueError("The log file is empty")
-        # Leave room for concat to allocate its output alongside the chunks.
-        while self._stored_mb() > self.frame_budget_mb * 0.72:
-            self._thin_once()
         df = pd.concat(self.chunks, ignore_index=True, sort=False, copy=False)
         self.chunks.clear()
-        # Categories are chosen once from the completed frame so parser chunks
-        # never carry incompatible categorical dictionaries.
         optimise_dtypes(df, categorise_text=True)
-        all_null = [c for c in df.columns if df[c].isna().all()]
-        if all_null:
-            df.drop(columns=all_null, inplace=True)
-        mapping = detect_columns(df)
-        timestamp = mapping.get("timestamp")
+        timestamp = detect_columns(df).get("timestamp")
         if timestamp and not df[timestamp].is_monotonic_increasing:
             df.sort_values(timestamp, inplace=True, kind="stable", ignore_index=True)
         ensure_vmg(df)
-        df.attrs["nightjar_source_rows"] = int(self.input_rows)
-        df.attrs["nightjar_retained_rows"] = int(len(df))
-        df.attrs["nightjar_sampling_stride"] = int(self.stride)
-        df.attrs["nightjar_memory_budget_mb"] = float(self.frame_budget_mb)
-        gc.collect()
+        df.attrs["nightjar_source_rows"] = self.input_rows
+        df.attrs["nightjar_retained_rows"] = len(df)
+        df.attrs["nightjar_sampling_stride"] = 1
         return df
 
 
@@ -447,7 +387,7 @@ def parse_sparse_stream(src, chunk_rows=None):
         5000,
         int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "12000")),
     )
-    collector = _BoundedLogCollector()
+    collector = _FullLogCollector()
     handle, close_handle = _text_stream(src)
     reader = csv.reader(handle)
     names = None
@@ -545,7 +485,7 @@ def _is_sparse_log(src):
 def parse_standard_stream(src, chunk_rows=None):
     """Read a conventional CSV sequentially and retain a RAM-bounded frame."""
     chunk_rows = max(5000, int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "12000")))
-    collector = _BoundedLogCollector()
+    collector = _FullLogCollector()
     kwargs = dict(chunksize=chunk_rows, low_memory=True, on_bad_lines="warn")
     if isinstance(src, (str, Path)):
         kwargs["memory_map"] = True
@@ -563,7 +503,7 @@ def parse_standard_stream(src, chunk_rows=None):
 
 
 def parse_log(src):
-    """Sequential, memory-bounded log loader used by Nightjar 0.8.0."""
+    """Sequential full-resolution log loader used by Nightjar 0.10.0."""
     if _is_sparse_log(src):
         return parse_sparse_stream(src)
     try:
@@ -833,7 +773,7 @@ def colour_group_controls(prefix, multi_event, twa_available):
         by_event = st.toggle(
             "Colour by event", value=False, key=f"{prefix}_colour_by_event",
             disabled=not multi_event,
-        ) if multi_event else False
+        )
     with c2:
         by_tack = st.toggle(
             "Colour by tack", value=False, key=f"{prefix}_colour_by_tack",
@@ -946,9 +886,6 @@ def half_polar_sailing_plot(df, m, polar, target, y_range=None):
         radial = pd.to_numeric(df[bsp], errors="coerce").to_numpy(dtype=np.float32, na_value=np.nan)
         angle_valid = pd.to_numeric(df[twa], errors="coerce").notna().to_numpy()
         valid_positions = np.flatnonzero(angle_valid & np.isfinite(radial) & (radial >= r_min) & (radial <= r_max))
-        plot_limit = int(st.session_state.get("nightjar_max_plot_points", 12000))
-        if len(valid_positions) > plot_limit:
-            valid_positions = np.sort(np.random.default_rng(42).choice(valid_positions, plot_limit, replace=False))
         plot_columns = [c for c in (bsp, twa, tws, vmg) if c and c in df.columns]
         d = df.iloc[valid_positions].loc[:, plot_columns].copy()
         del radial, angle_valid, valid_positions
@@ -976,7 +913,7 @@ def half_polar_sailing_plot(df, m, polar, target, y_range=None):
 
 def polar_plot(df, m, polar, target, half, plot_space, y_range=None, colour_group=None):
     bsp, twa, tws, awa, vmg = [m.get(k) for k in ("bsp", "twa", "tws", "awa", "vmg")]
-    if colour_group and colour_group in df.columns and df[colour_group].nunique(dropna=True) > 1:
+    if colour_group and colour_group in df.columns and not df.empty:
         # Build the grid/target once, then append one categorical trace per group.
         combined = polar_plot(df.iloc[0:0], m, polar, target, half, plot_space, y_range, None)
         palette = px.colors.qualitative.Plotly
@@ -988,7 +925,7 @@ def polar_plot(df, m, polar, target, half, plot_space, y_range=None, colour_grou
                 if getattr(trace, "name", None) == "Actual":
                     trace.name = str(group_name)
                     trace.legendgroup = str(group_name)
-                    trace.marker.color = palette[index % len(palette)]
+                    trace.marker.color = group_colour(group_name, index, colour_group)
                     trace.marker.showscale = False
                     trace.marker.colorbar = None
                     combined.add_trace(trace)
@@ -999,9 +936,6 @@ def polar_plot(df, m, polar, target, half, plot_space, y_range=None, colour_grou
         return half_polar_sailing_plot(df, m, polar, target, y_range)
     if bsp and twa and not df.empty:
         valid_positions = np.flatnonzero(df[bsp].notna().to_numpy() & df[twa].notna().to_numpy())
-        plot_limit = int(st.session_state.get("nightjar_max_plot_points", 12000))
-        if len(valid_positions) > plot_limit:
-            valid_positions = np.sort(np.random.default_rng(42).choice(valid_positions, plot_limit, replace=False))
         plot_columns = [c for c in (bsp, twa, tws, vmg) if c and c in df.columns]
         d = df.iloc[valid_positions].loc[:, plot_columns].copy()
         del valid_positions
@@ -1050,16 +984,123 @@ def find_gun_events(events):
     return guns
 
 
+def gun_times_in_log_clock(events, log_timezone=None):
+    """UTC event times -> the log's clock, using date-specific UK DST rules.
+
+    Naive log timestamps are UK local by default. Select UTC in Settings for
+    genuinely UTC logs; a timezone cannot be inferred safely from naive values.
+    """
+    if events is None or events.empty or "Time" not in events:
+        return events
+    zone = log_timezone or st.session_state.get("nightjar_log_timezone", "Europe/London")
+    out = events.copy()
+    utc = pd.to_datetime(out["Time"], errors="coerce", utc=True, format="mixed", dayfirst=True)
+    out["Time"] = utc.dt.tz_convert(zone).dt.tz_localize(None)
+    out["_nightjar_gun_utc"] = utc
+    return out
+
+
+def tack_colour_map():
+    return {"Port": "#ff3333", "Starboard": "#00cc66", "Unknown": "#999999"}
+
+
+def group_colour(group, index, kind):
+    if kind == "Tack":
+        return tack_colour_map().get(str(group), "#999999")
+    palette = px.colors.qualitative.Plotly
+    return palette[index % len(palette)]
+
+
+def _remember_mapping(key):
+    saved = dict(st.session_state.get("nightjar_mapping", {}))
+    saved[key] = st.session_state[f"map_{key}"]
+    st.session_state["nightjar_mapping"] = saved
+
+
+def _remember_variables():
+    st.session_state["nightjar_enabled_variables"] = list(st.session_state["settings_variables"])
+
+
+def _remember_clock():
+    st.session_state["nightjar_log_timezone"] = st.session_state["settings_log_timezone"]
+
+
+def _choose_variables(columns):
+    st.session_state["nightjar_enabled_variables"] = list(columns)
+    st.session_state["settings_variables"] = list(columns)
+
+
+def enabled_variables(columns):
+    available = list(columns)
+    previous = st.session_state.get("nightjar_known_variables", [])
+    enabled = st.session_state.get("nightjar_enabled_variables", available)
+    enabled = [c for c in enabled if c in available]
+    enabled += [c for c in available if c not in previous and c not in enabled]
+    st.session_state["nightjar_known_variables"] = available
+    st.session_state["nightjar_enabled_variables"] = enabled
+    return enabled
+
+
+def render_settings(df, mapping, keys):
+    st.subheader("Settings")
+    st.subheader("Plotting performance")
+    st.info("Full-resolution loading and plotting: no automatic downsampling, row caps or application RAM/download budgets. Only the active page is rendered. Server and browser capacity still apply.")
+    st.subheader("GUN time correction")
+    zone = st.session_state.get("nightjar_log_timezone", "Europe/London")
+    st.selectbox("Log timestamp clock", ["Europe/London", "UTC"],
+                 index=0 if zone == "Europe/London" else 1,
+                 key="settings_log_timezone", on_change=_remember_clock,
+                 help="GUN event times are UTC. UK local logs use automatic BST/GMT correction. Select UTC if the log is already UTC. Raw event data is not changed.")
+    st.subheader("Variables available for plotting")
+    chosen = enabled_variables(df.columns)
+    a, b = st.columns(2)
+    a.button("Select all variables", on_click=_choose_variables, args=(list(df.columns),))
+    b.button("Select no variables", on_click=_choose_variables, args=([],))
+    st.multiselect("Included Expedition variables", list(df.columns), default=chosen,
+                   key="settings_variables", on_change=_remember_variables)
+    st.caption("All variables are enabled initially. Exclusions affect plot selectors, Overview channels and hover fields, not stored data, calculations, exports or column mapping. Required coordinates remain available for fixed polar/map plots.")
+    st.subheader("Column mapping")
+    for key in keys:
+        options = [None] + list(df.columns)
+        current = mapping.get(key)
+        st.selectbox(key.upper(), options, index=options.index(current) if current in options else 0,
+                     format_func=lambda x: "Not mapped" if x is None else str(x),
+                     key=f"map_{key}", on_change=_remember_mapping, args=(key,))
+    st.caption("Changes apply immediately and persist while navigating this session.")
+
+
+def read_table_file(src):
+    """Read EventData/TestData without a row limit; preserve source cell values."""
+    if src is None:
+        return pd.DataFrame()
+    rows = list(csv.reader(io.StringIO(decode(src))))
+    rows = [r for r in rows if any(str(v).strip() for v in r)]
+    if not rows:
+        return pd.DataFrame()
+    width = max(map(len, rows))
+    header = rows[0] + [f"Extra column {i+1}" for i in range(len(rows[0]), width)]
+    names, counts = [], {}
+    for i, value in enumerate(header):
+        name = value.strip() or f"Column {i+1}"
+        counts[name] = counts.get(name, 0) + 1
+        names.append(name if counts[name] == 1 else f"{name} ({counts[name]})")
+    return pd.DataFrame([r + [""] * (width-len(r)) for r in rows[1:]], columns=names)
+
+
 def gun_mask_for_dates(timestamps, events, dates):
     """Return a compact row mask applying GUN-minus-five-minutes per event day."""
     mask = np.ones(len(timestamps), dtype=bool)
     warnings = []
-    guns = find_gun_events(events)
+    guns = find_gun_events(gun_times_in_log_clock(events))
     if guns.empty:
         return mask, [
             "No GUN entries were found in the Expedition events file. "
             "Please filter by time manually."
         ]
+    log_zone = str(getattr(timestamps.dt, "tz", None) or st.session_state.get("nightjar_log_timezone", "Europe/London"))
+    if getattr(timestamps.dt, "tz", None) is not None:
+        guns = find_gun_events(gun_times_in_log_clock(events, log_zone))
+        timestamps = timestamps.dt.tz_localize(None)
     data_days = normalised_days(timestamps)
     gun_days = normalised_days(guns["Time"])
     for dte in dates:
@@ -1071,10 +1112,10 @@ def gun_mask_for_dates(timestamps, events, dates):
                 f"No GUN entry found for {dte}. Please filter this event manually if required."
             )
             continue
-        gun_time = pd.Timestamp(day_guns.iloc[0]["Time"])
-        mask[on_day] &= timestamps.loc[on_day].ge(
-            gun_time - pd.Timedelta(minutes=5)
-        ).to_numpy()
+        zone = log_zone
+        # Subtract in UTC before conversion, including on DST transition days.
+        cutoff = (pd.Timestamp(day_guns.iloc[0]["_nightjar_gun_utc"]) - pd.Timedelta(minutes=5)).tz_convert(zone).tz_localize(None)
+        mask[on_day] &= timestamps.loc[on_day].ge(cutoff).to_numpy()
     return mask, warnings
 
 
@@ -1127,7 +1168,7 @@ def make_event_summary(filtered, event_list, events, mapping, polar=None):
             summary_columns.append(c)
     summary_data = filtered.loc[:, summary_columns]
     summary_days = normalised_days(summary_data[ts])
-    guns = find_gun_events(events)
+    guns = find_gun_events(gun_times_in_log_clock(events))
     gun_days = normalised_days(guns["Time"]) if not guns.empty else None
 
     if event_list is None or event_list.empty:
@@ -1280,11 +1321,48 @@ h1,h2,h3,h4,h5,h6,p{ text-align:center; }
     return False
 
 
+def render_file_viewer(src):
+    st.subheader("File viewer")
+    choice = st.radio("File to view", ["EventData", "TestData"], horizontal=True, key="viewer_file")
+    source = src["events" if choice == "EventData" else "tests"]
+    if source is None:
+        st.info(f"Upload {choice}.csv or place it in /Data.")
+    else:
+        try:
+            table = read_table_file(source)
+            st.caption(f"{choice}: {len(table):,} rows, {len(table.columns):,} columns. Complete source file; event filters do not restrict this view.")
+            st.dataframe(table, width="stretch", hide_index=True)
+        except Exception as exc:
+            st.error(f"Could not read {choice}: {exc}")
+
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     if not require_password():
         st.stop()
+    show_sidebar = st.toggle("Show event sidebar", value=True, key="nightjar_show_sidebar")
+    if not show_sidebar:
+        st.markdown("<style>section[data-testid='stSidebar']{display:none!important;}</style>", unsafe_allow_html=True)
+    # A single active page is executed per rerun. Streamlit tabs execute every tab,
+    # including hidden plotting code, which was the main source of temporary RAM growth.
+    page_names = ["Overview","Event summary","Polar analysis","Map View","Variable plot","Files and sail chart","File viewer","Settings"]
+    st.markdown("""
+    <style>
+    div[data-testid="stRadio"]:has(input[value="Overview"]) div[role="radiogroup"]{gap:1.25rem;border-bottom:1px solid rgba(242,140,40,.55);padding-bottom:0;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label{padding:.55rem .15rem;border:0!important;border-radius:0!important;background:transparent!important;cursor:pointer;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:has(input:checked){color:#f28c28!important;border-bottom:3px solid #f28c28!important;}
+    div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover{color:#f28c28!important;}
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown("""<style>div[role=radiogroup]{border-bottom:none!important;} div[role=radiogroup] label{border:2px solid #666;padding:8px 16px;border-radius:10px 10px 0 0;margin-right:4px;} div[role=radiogroup] label:has(input:checked){border-color:#f28c28;background:rgba(242,140,40,.15);} </style>""",unsafe_allow_html=True)
+    active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
+    previous_page = st.session_state.get("nightjar_previous_page")
+    if previous_page != active_page:
+        st.session_state["nightjar_previous_page"] = active_page
+        gc.collect()
+
     pass
     if st.sidebar.button("Sign out", key="nightjar_sign_out"):
         st.session_state["nightjar_authenticated"] = False
@@ -1309,6 +1387,9 @@ def main():
     defs = [("log","Expedition log",["csv","txt"]),("polar","Target polar",["txt","csv","pol"]),("events","Expedition events",["csv","txt"]),("event_list","Event list",["txt","csv"]),("tests","Expedition tests",["csv"]),("sail_chart","Sail selection chart",["xml"]),("debrief","Debrief notes",["txt","md","docx"])]
     ups = {k: st.sidebar.file_uploader(n, type=t, key=f"file_{k}") for k,n,t in defs}
     src = {k: (v if k == "debrief" else local(v,k)) for k,v in ups.items()}
+    if not src["log"] and active_page == "File viewer":
+        render_file_viewer(src)
+        return
     if not src["log"]:
         with event_filter_container:
             st.subheader("Event filters")
@@ -1320,14 +1401,6 @@ def main():
     except Exception as e:
         st.error(f"Could not read log: {e}")
         st.stop()
-    source_rows = int(df.attrs.get("nightjar_source_rows", len(df)))
-    sampling_stride = int(df.attrs.get("nightjar_sampling_stride", 1))
-    if sampling_stride > 1:
-        st.warning(
-            f"Memory-safe sequential loading retained {len(df):,} of "
-            f"{source_rows:,} data rows (approximately every {sampling_stride:,}th row). "
-            "Date/time coverage is preserved, but summaries use the retained sample."
-        )
     memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
     events = load_events_fast(src["events"])
     event_list = load_event_list_fast(src["event_list"])
@@ -1337,8 +1410,13 @@ def main():
     m = detect_columns(df)
     mapping_keys = ("timestamp","bsp","twa","tws","awa","vmg","vmg_pct","heel","drift","lat","lon")
     for k in mapping_keys:
-        saved = st.session_state.get(f"map_{k}", m.get(k))
+        saved = st.session_state.get("nightjar_mapping", {}).get(k, m.get(k))
         m[k] = saved if saved is None or saved in df.columns else m.get(k)
+    enabled = enabled_variables(df.columns)
+    if active_page == "Settings":
+        render_settings(df, m, mapping_keys)
+        m.update({k: v for k, v in st.session_state.get("nightjar_mapping", {}).items() if v is None or v in df.columns})
+        enabled = enabled_variables(df.columns)
     ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
 
     row_mask = np.ones(len(df), dtype=bool)
@@ -1346,8 +1424,6 @@ def main():
     selected_events = []
     selected_event_dates = []
     selected_rows = pd.DataFrame(columns=["date", "type", "event"])
-    performance_mode = True
-    max_plot_points = 10000
     trim_data = False
 
     with event_filter_container:
@@ -1355,9 +1431,6 @@ def main():
         if ts and pd.api.types.is_datetime64_any_dtype(df[ts]):
             good = df[ts].dropna()
             if not good.empty:
-                performance_mode = st.checkbox("Performance mode", value=True, key="perf_mode")
-                st.caption("Limits each figure to at most 10,000 plotted points to reduce browser and server memory use.")
-                max_plot_points = st.number_input("Maximum plotted points", min_value=1000, max_value=10000, value=10000, step=1000, key="max_plot_points")
 
                 filtered_event_list = event_list.copy()
                 if not filtered_event_list.empty and "type" in filtered_event_list.columns:
@@ -1429,43 +1502,17 @@ def main():
         filtered_positions = np.flatnonzero(row_mask)
         del row_mask
 
-    st.sidebar.subheader("Column mapping")
-    for k in mapping_keys:
-        opts = [None] + list(df.columns)
-        cur = m.get(k)
-        m[k] = st.sidebar.selectbox(k.upper(), opts, index=opts.index(cur) if cur in opts else 0, format_func=lambda x:"Not mapped" if x is None else str(x), key=f"map_{k}")
-    ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
-    st.session_state["nightjar_max_plot_points"] = int(max_plot_points)
-    st.session_state["nightjar_performance_mode"] = bool(performance_mode)
     multi_event = len(selected_events) > 1
     st.session_state["pending_gun_warnings"] = locals().get("pending_gun_warnings", [])
 
     debrief_text = read_debrief_file(src.get("debrief"))
-    # A single active page is executed per rerun. Streamlit tabs execute every tab,
-    # including hidden plotting code, which was the main source of temporary RAM growth.
-    page_names = ["Overview","Event summary","Polar analysis","GPS track","Variable plot","Files and sail chart"]
-    st.markdown("""
-    <style>
-    div[data-testid="stRadio"]:has(input[value="Overview"]) div[role="radiogroup"]{gap:1.25rem;border-bottom:1px solid rgba(242,140,40,.55);padding-bottom:0;}
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label{padding:.55rem .15rem;border:0!important;border-radius:0!important;background:transparent!important;cursor:pointer;}
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label:has(input:checked){color:#f28c28!important;border-bottom:3px solid #f28c28!important;}
-    div[data-testid="stRadio"]:has(input[value="Overview"]) label:hover{color:#f28c28!important;}
-    </style>
-    """, unsafe_allow_html=True)
-    st.markdown("""<style>div[role=radiogroup]{border-bottom:none!important;} div[role=radiogroup] label{border:2px solid #666;padding:8px 16px;border-radius:10px 10px 0 0;margin-right:4px;} div[role=radiogroup] label:has(input:checked){border-color:#f28c28;background:rgba(242,140,40,.15);} </style>""",unsafe_allow_html=True)
-    active_page = st.radio("Analysis page", page_names, horizontal=True, label_visibility="collapsed", key="nightjar_active_page")
-    previous_page = st.session_state.get("nightjar_previous_page")
-    if previous_page != active_page:
-        st.session_state["nightjar_previous_page"] = active_page
-        gc.collect()
-
     if active_page == "Overview":
         page_columns = [ts, bsp, tws, vmg, vmg_pct, heel, twa]
     elif active_page == "Event summary":
         page_columns = [ts, twa, tws, awa, bsp, vmg, vmg_pct]
     elif active_page == "Polar analysis":
         page_columns = [ts, bsp, twa, tws, awa, vmg, vmg_pct, heel, drift, m.get("lat"), m.get("lon")]
-    elif active_page in ("GPS track", "Variable plot"):
+    elif active_page in ("Map View", "Variable plot"):
         page_columns = [ts] + df.select_dtypes(include=np.number).columns.tolist()
     else:
         page_columns = None
@@ -1480,9 +1527,9 @@ def main():
         ms[3].metric("Mean VMG", f"{filtered[vmg].mean():.2f} kt" if vmg else "n/a")
         ms[4].metric("Channels", len(df.columns))
         if ts:
-            cols = [c for c in (bsp,tws,vmg,vmg_pct,heel,twa) if c]
+            cols = list(dict.fromkeys(c for c in (bsp,tws,vmg,vmg_pct,heel,twa) if c and c in enabled))
             if cols:
-                overview_plot_df = downsample_rows(filtered, max_plot_points) if performance_mode else filtered
+                overview_plot_df = filtered
                 if colour_group_overview == "Event":
                     overview_plot_df = add_event_labels(overview_plot_df, ts, selected_rows)
                 elif colour_group_overview == "Tack":
@@ -1496,7 +1543,7 @@ def main():
                 ).dropna()
                 if colour_group_overview and colour_group_overview in long:
                     fig = px.line(
-                        long, x=ts, y="Value", color=colour_group_overview,
+                        long, x=ts, y="Value", color=colour_group_overview, color_discrete_map=tack_colour_map() if colour_group_overview == "Tack" else None,
                         line_dash="Channel",
                         title=f"Selected time series coloured by {colour_group_overview.lower()}",
                     )
@@ -1571,13 +1618,13 @@ def main():
         st.caption(f"Plotting {len(local_data):,} records | {avg_note}. Half polar uses 0° to 180°.")
         if bsp and twa:
             st.plotly_chart(polar_plot(local_data, m, polar, target, layout.startswith("Half"), plot_space, (yr_min,yr_max), colour_group_polar), width="stretch")
-    if active_page == "GPS track":
+    if active_page == "Map View":
         colour_group_gps = colour_group_controls("gps", multi_event, bool(twa))
         categorical_colour_gps = bool(colour_group_gps)
         lat, lon = m.get("lat"), m.get("lon")
         if lat and lon and int((filtered[lat].notna() & filtered[lon].notna()).sum()) > 1:
             settings = st.session_state.get("nightjar_avg_settings", {"seconds": 1, "max_tws": 99.0, "max_bsp": 99.0})
-            nums = filtered.select_dtypes(include=np.number).columns.tolist()
+            nums = [c for c in filtered.select_dtypes(include=np.number).columns if c in enabled]
             default_colour = vmg if vmg in nums else (bsp if bsp in nums else (nums[0] if nums else None))
             if not nums:
                 st.warning("No numeric channels are available to colour the GPS track.")
@@ -1603,9 +1650,6 @@ def main():
                     signed_twa_col=twa,
                 )
                 valid_positions = np.flatnonzero(gps_base[lat].notna().to_numpy() & gps_base[lon].notna().to_numpy())
-                gps_limit = min(10000, int(max_plot_points))
-                if len(valid_positions) > gps_limit:
-                    valid_positions = valid_positions[::math.ceil(len(valid_positions) / gps_limit)]
                 d = gps_base.iloc[valid_positions].copy()
                 del gps_base, valid_positions
                 if colour_group_gps == "Event":
@@ -1634,7 +1678,7 @@ def main():
 
                 hover_numeric = [
                     c for c in (twa, tws, awa, heel, vmg, vmg_pct, drift, bsp)
-                    if c and c in d
+                    if c and c in d and c in enabled
                 ]
                 centre = {"lat": float(d[lat].mean()), "lon": float(d[lon].mean())}
 
@@ -1656,7 +1700,7 @@ def main():
                             name=str(group_name), text=hover_time, customdata=hover_data,
                             hovertemplate=hover_template,
                             marker=dict(
-                                size=8, color=palette[colour_index % len(palette)], opacity=0.82
+                                size=8, color=group_colour(group_name, colour_index, colour_group_gps), opacity=0.82
                             ),
                         ))
                     gps_title = (
@@ -1688,7 +1732,7 @@ def main():
     if active_page == "Variable plot":
         colour_group_var = colour_group_controls("var", multi_event, bool(twa))
         categorical_colour_var = bool(colour_group_var)
-        nums = filtered.select_dtypes(include=np.number).columns.tolist()
+        nums = [c for c in filtered.select_dtypes(include=np.number).columns if c in enabled]
         if len(nums) < 2:
             st.info("At least two numeric variables are required")
         else:
@@ -1772,8 +1816,6 @@ def main():
 
             needed = [xn,yn] + ([cn] if numeric_colour else [])
             vd = vd.dropna(subset=needed)
-            if performance_mode and len(vd) > max_plot_points:
-                vd = vd.sample(max_plot_points, random_state=42)
 
             # Keep these ranges independent of the selected variable names. They are
             # initialised once and only change through the controls or Auto scale.
@@ -1811,15 +1853,15 @@ def main():
 
             if kind == "Cartesian":
                 if colour_group_var and colour_group_var in vd:
-                    fig = px.scatter(vd, x=xn, y=yn, color=colour_group_var, opacity=.62)
+                    fig = px.scatter(vd, x=xn, y=yn, color=colour_group_var, opacity=.62, color_discrete_map=tack_colour_map() if colour_group_var == "Tack" else None)
                 else:
                     fig = px.scatter(vd, x=xn, y=yn, color=cn if numeric_colour else None, opacity=.62,
                                      color_continuous_scale="Turbo", range_color=colour_range)
                 fig.update_traces(
                     hovertemplate=f"{xn}: %{{x:.4g}}<br>{yn}: %{{y:.4g}}<extra></extra>"
                 )
-                fig.update_xaxes(range=[axis_xmin,axis_xmax])
-                fig.update_yaxes(range=[axis_ymin,axis_ymax])
+                fig.update_xaxes(title_text=xn, range=[axis_xmin,axis_xmax])
+                fig.update_yaxes(title_text=yn, range=[axis_ymin,axis_ymax])
             else:
                 fig = go.Figure()
                 if colour_group_var and colour_group_var in vd:
@@ -1832,7 +1874,7 @@ def main():
                             name=str(group_name),
                             marker=dict(
                                 size=6, opacity=.62,
-                                color=palette[colour_index % len(palette)],
+                                color=group_colour(group_name, colour_index, colour_group_var),
                             ),
                             hovertemplate=f"{xn}: %{{theta:.4g}}<br>{yn}: %{{r:.4g}}<extra></extra>",
                         ))
@@ -1846,23 +1888,33 @@ def main():
                                                   hovertemplate=f"{xn}: %{{theta:.4g}}<br>{yn}: %{{r:.4g}}<extra></extra>"))
                 fig.update_layout(polar=dict(sector=[axis_xmin,axis_xmax],
                                              angularaxis=dict(direction="clockwise", rotation=90),
-                                             radialaxis=dict(range=[axis_ymin,axis_ymax])))
+                                             radialaxis=dict(title=dict(text=yn), range=[axis_ymin,axis_ymax])))
+                fig.add_annotation(text=f"Angular variable: {xn}", x=0.5, y=-0.12, xref="paper", yref="paper", showarrow=False)
             fig.update_layout(template="plotly_dark", height=635, title=f"{yn} against {xn} ({avg_note})", uirevision="nightjar-variable-axes")
             st.plotly_chart(fig, width="stretch")
             st.caption(f"Displaying {len(vd):,} records")
 
+    if active_page == "File viewer":
+        render_file_viewer(src)
+
     if active_page == "Files and sail chart":
         if src["sail_chart"]:
-            try: sails = load_sails_fast(src["sail_chart"]); st.plotly_chart(sail_fig(sails), width="stretch"); st.dataframe(round_numeric_df(sails), width="stretch", height=270)
+            try:
+                sails = load_sails_fast(src["sail_chart"])
+                fig = sail_fig(sails)
+                sail_group = colour_group_controls("sail", multi_event, bool(twa))
+                if sail_group and twa and tws:
+                    overlay = filtered.loc[:, list(dict.fromkeys(c for c in (ts, twa, tws) if c))].copy()
+                    overlay = add_tack_labels(overlay, twa) if sail_group == "Tack" else add_event_labels(overlay, ts, selected_rows)
+                    if sail_group in overlay:
+                        for i, (name, group) in enumerate(overlay.groupby(sail_group, observed=True, sort=False)):
+                            fig.add_trace(go.Scatter(x=signed_twa(group[twa]).abs(), y=group[tws], mode="markers", name=str(name), marker=dict(color=group_colour(name, i, sail_group), size=5)))
+                st.plotly_chart(fig, width="stretch")
+                st.dataframe(round_numeric_df(sails), width="stretch", height=270)
             except Exception as e: st.warning(f"Sail chart could not be parsed: {e}")
-        download_limit_mb = float(os.environ.get("NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB", "32"))
-        filtered_mb = dataframe_memory_mb(filtered)
-        if filtered_mb <= download_limit_mb:
-            st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), "nightjar_filtered_log_0.8.0.csv", "text/csv", key="download_filtered")
-        else:
-            st.info(f"CSV download is disabled for this {filtered_mb:.0f} MiB selection to protect server memory. Narrow the filter, or raise NIGHTJAR_MAX_IN_MEMORY_DOWNLOAD_MB if Railway has sufficient RAM.")
+        st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), f"nightjar_filtered_log_{APP_VERSION}.csv", "text/csv", key="download_filtered")
         session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.8.0.json", "application/json", key="download_session")
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.10.0.json", "application/json", key="download_session")
     # Refresh after the active page has been built so the sidebar reports the
     # process resident set, including the current plot's temporary objects.
     gc.collect()

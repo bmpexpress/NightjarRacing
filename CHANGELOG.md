@@ -1,32 +1,55 @@
 # Nightjar Data Analysis Changelog
 
-This changelog records releases, fixes, implementation notes and planned work for the Nightjar Data Analysis website.
+## 0.10.0 - Streamlit update from accepted 0.8.1 baseline
 
-> Security note: credentials and passwords are intentionally excluded from this repository file. Store secrets in Railway environment variables or another secret store, never in source control.
+The uploaded app.py is the accepted 0.8.1 baseline; its old 0.8.0 version declaration was stale. This release remains Python/Streamlit and does not reintroduce the Java migration.
+
+### Changes implemented
+1. Automatic date-specific BST/GMT correction for UTC GUN times when trimming UK-local logs. The five-minute lead-in is subtracted in UTC before timezone conversion. Settings includes a UTC log-clock option to avoid double correction for UTC logs. Source EventData remains unchanged.
+2. Removed loading-time record thinning, plot downsampling, point caps, application RAM budgets and the CSV download memory-size restriction. Chunked parsing and dtype optimisation remain, but retain every valid own-boat record. Old sampled Parquet caches are not reused.
+3. Added a Show event sidebar toggle in the main area; event selection remains in the sidebar and is preserved when hidden.
+4. Moved column mapping to Settings. The former performance-mode and point-limit controls are removed, not re-enabled; Settings explains full-resolution plotting. Single-active-page rendering remains.
+5. Event/tack colour controls are visible on plot pages. Port/negative signed TWA is red; starboard/positive signed TWA is green. Event colouring is enabled when multiple events are selected. Sail-chart polygons retain their sail colours; an optional actual-data overlay supplies event/tack colouring.
+6. Variable plots automatically label Cartesian axes with selected variable names, and label radial/angular variables in polar mode.
+7. Renamed GPS track navigation to Map View.
+8. Settings lists all loaded Expedition variables, enabled by default, with select-all/select-none and individual inclusion. Exclusions affect selectable plot channels and Overview channels, not stored data, calculations or exports. Fixed map/polar coordinates remain available. Mapping and variable choices persist across page navigation within the session.
+9. Added File viewer for complete EventData and TestData tables from uploads or /Data. The viewer does not apply event filters or truncate at 500 rows, and can operate without a master log.
+
+### Dependencies
+- Retained the original Streamlit, pandas, NumPy and Plotly version ranges.
+- Explicitly declared tzdata for timezone availability and python-docx for the existing DOCX debrief reader.
+
+### Verification and limits
+- Python syntax compilation and 50 targeted checks passed using constructed test fixtures, not actual sailing data.
+- Checks cover summer/winter and DST transitions, GUN-minus-five-minute boundaries, full record retention, VMG preservation, polar point counts, tack colours, page execution, settings persistence, variable exclusions and 601-row file viewing.
+- Streamlit AppTest used a table-rendering substitute because the sandbox Arrow/NumPy installation is incompatible. Table preparation was tested; actual Arrow table rendering, browser appearance and Railway deployment were not verified.
+- Full-resolution plotting can exhaust actual server/browser resources; removing application limits does not increase provisioned capacity.
+- Naive timestamps do not identify their timezone. UK-local log time is the default assumption; select UTC in Settings for UTC logs. GUN source times are assumed UTC.
+
+## Historical development notes
+
+Historical requests and future ideas below are retained as history, not claims of implementation in 0.10.0. Text was recovered from the previously supplied Changelog.docx; embedded screenshots are not reproduced.
+
 
 ## 20260821 – MVP Rev0.1
 
-## Notes
+
+## Notes.
 
 - Version runs well, once I got my head around the mapping.
 - Saved app app_0.1.py
 
 ## Requested updated for Rev0.2
 
-### In GPS track tab
-
+- In GPS track tab:
 - round off the time to the nearest second.
 - Display the heel as a tooltip point.
 - Display VMG as a tooltip point.
 - Display Tide rate (Drift) as a tooltip point.
 - Colour by VMG instead of BSP.
-
-### In the overview Tab
-
+- In the overview Tab:
 - Add VMG Values to the overview plot.
-
-### In the Polar analysis Tab
-
+- In the Polar analysis Tab:
 - Change values on the starboard tack to be negative values, instead of > 180 degrees.
 - Add ability to show all data, or to show just for a given wind range, with a given “bin” above and below.
 - Add ability to display data on a full polar plot or on a ½ plot (i.e. using abs values)
@@ -52,6 +75,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 20260821 – App_0.3.py
 
+
 ## Review
 
 - VMG Channel missing from overview plot.
@@ -63,9 +87,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - remove “nearest second” from the tool tip description for time.
 - be able to choose to colour by bsp or VMG, or other variables.
 - Add adjusting the limits of the colour scaling
-
-### In the variable plot tab
-
+- In the variable plot tab:
 - Add the ability to choose the colour scaling limits for the plot.
 - In the polar plotting tab,
 - choose to plot in cartesian or polar space. Also choose the y axis limits.
@@ -74,47 +96,41 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 20260822 – App_0.4
 
+
 ## Comments
+
 
 ## Changes requested
 
-### Changes to the appearance of the page
-
+- Changes to the appearance of the page:
 - Move Nightjar logo into top of sidebar top left.
 - Reduce the header space above the tabs to maximise usable on screen space.
 - When a box is ticked or tab selected instead of red change colour to orange instead.
 - When the mosue hover
 - Add a time filter option for the data in the left pane as well as date filtering so you can choose the data to display by time window as well as date.
-
-### In the gps track
-
+- In the gps track:
 - match the data plot to the time average in the polar analysis tab.
 - As well as the dots, show a line along the boat’s track.
 - Add in an absolute value button for the data used for scaling (e.g. so that heel displays only from 0 upwards)
-
-### In the Variable Plot
-
+- In the Variable Plot:
 - Also add time averaging with tolerances on variable magnitudes changing during the averaging window.
 
 ## 20260822 – App_0.5, 0.5.1, 0.5.2,0.5.3,0.5.4
+
 
 ## Notes / bug fixes
 
 - ERROR IN POLAR PLOT PAGE. – Due to two widgets (check boxes) having the same name - Resolved in 0.5.1 version by giving unique ID to each instead.
 - ERROR in GPS Track page, Map data not showing – Due to style error in mapbox – Resolved in 0.5.2 verison.
-
-### Error in GPS track page, points with nan data plotting as part of the track
-
+- Error in GPS track page, points with nan data plotting as part of the track:
 - Fixed in 0.5.3 version.
-
-### Appearance not correct
-
+- Appearance not correct:
 - When hovering over text it should appear orange not red.
 - All of the selected buttons / tick boxes should be orange not red too.
 - Also Polar plot being incorrect when ½ plotted only.
 - Fixed in 0.5.4, 0.5.5 version.
 
-## 0.5.5 still plotting this wrong
+### 0.5.5 still plotting this wrong.
 
 - In 0.5.6 the nan data plotting error has come back. Solved previously in version 0.5.3. Ask to re-fix in next version.
 
@@ -135,7 +151,9 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 20260822 – 0.6.0
 
+
 ## Bug fix versions
+
 
 ### 0.6.0 Notes
 
@@ -150,20 +168,16 @@ This changelog records releases, fixes, implementation notes and planned work fo
 ### 0.6.1
 
 - Remove the loading bar.
-
-### Change these from red to orange
-
-- Hovering over text.
-- The fill in these boxes
-- This warning box.
+- Change these from red to orange:
+- - Hovering over text.
+- - The fill in these boxes
+- - This warning box.
 - Move this header to the Top of the left Pane, so there is more useable space in the interface:
 
 ## 0.6.2
 
 - Above changes implemented.
-
-### For next version, resolve
-
+- For next version, resolve:
 - For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
 - C:\Users\Bryn.Phillips\OneDrive - Ward and Burke\Documents\99. MISC personal\Sailing\2026 - Nightjar\Website\20260821 - MVP\app_0.6.2.py:821: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
 - session = {"version":APP_VERSION, "created_utc":datetime.utcnow().isoformat()+"Z", "rows":len(filtered), "mapping":m}
@@ -171,23 +185,21 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - `use_container_width` will be removed after 2025-12-31.
 - Time avg causes float error still
 - AttributeError: 'NotImplementedType' object has no attribute '_indexed_same'
-
-### Traceback
-
-    File "C:\Users\Bryn.Phillips\OneDrive - Ward and Burke\Documents\99. MISC personal\Sailing\2026 - Nightjar\Website\20260821 - MVP\app_0.6.2.py", line 823, in <module>
-    if __name__ == "__main__": main()
+- Traceback:
+- File "C:\Users\Bryn.Phillips\OneDrive - Ward and Burke\Documents\99. MISC personal\Sailing\2026 - Nightjar\Website\20260821 - MVP\app_0.6.2.py", line 823, in <module>
+- if __name__ == "__main__": main()
 - ~~~~^^
-    File "C:\Users\Bryn.Phillips\OneDrive - Ward and Burke\Documents\99. MISC personal\Sailing\2026 - Nightjar\Website\20260821 - MVP\app_0.6.2.py", line 791, in main
-    vd, avg_note = average_with_ranges(filtered, ts, avg_columns, int(vavg), tolerances, signed_twa_col=x if x==twa else None)
+- File "C:\Users\Bryn.Phillips\OneDrive - Ward and Burke\Documents\99. MISC personal\Sailing\2026 - Nightjar\Website\20260821 - MVP\app_0.6.2.py", line 791, in main
+- vd, avg_note = average_with_ranges(filtered, ts, avg_columns, int(vavg), tolerances, signed_twa_col=x if x==twa else None)
 - ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    File "C:\Users\Bryn.Phillips\OneDrive - Ward and Burke\Documents\99. MISC personal\Sailing\2026 - Nightjar\Website\20260821 - MVP\app_0.6.2.py", line 314, in average_with_ranges
-    if col in ranges and tol is not None: keep &= ranges[col] <= tol
+- File "C:\Users\Bryn.Phillips\OneDrive - Ward and Burke\Documents\99. MISC personal\Sailing\2026 - Nightjar\Website\20260821 - MVP\app_0.6.2.py", line 314, in average_with_ranges
+- if col in ranges and tol is not None: keep &= ranges[col] <= tol
 - ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    File "C:\Users\Bryn.Phillips\.conda\envs\Streamlitenv\Lib\site-packages\pandas\core\generic.py", line 12823, in __iand__
-    return self._inplace_method(other, type(self).__and__)  # type: ignore[operator]
+- File "C:\Users\Bryn.Phillips\.conda\envs\Streamlitenv\Lib\site-packages\pandas\core\generic.py", line 12823, in __iand__
+- return self._inplace_method(other, type(self).__and__)  # type: ignore[operator]
 - ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    File "C:\Users\Bryn.Phillips\.conda\envs\Streamlitenv\Lib\site-packages\pandas\core\generic.py", line 12758, in _inplace_method
-    and result._indexed_same(self)
+- File "C:\Users\Bryn.Phillips\.conda\envs\Streamlitenv\Lib\site-packages\pandas\core\generic.py", line 12758, in _inplace_method
+- and result._indexed_same(self)
 - ^^^^^^^^^^^^^^^^^^^^
 - GPS page auto scale function – add a button that automatically scales the colouring by the max and min values. Also add to the other graph pages.
 
@@ -199,13 +211,12 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 - Changed to “0_Master log file” as the log file. 230 MB Data.
 - Takes a long time to load data now. This file is very large, I wonder if there is a more efficient way to store / use the data.
-
-### OUTPUT
-
+- OUTPUT:
 - Missing – why.
 - Needs to scale by the currently selected data, not just vmg.
 
 ## 0.7.1
+
 
 ### Notes
 
@@ -217,13 +228,9 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - Do not use VMC, this is a different measurement.
 - Calculate VMG from BSP and TWA when loading the data in.
 - Polar analysis page. Also show the VMG and wind speed in the tool tip
-
-### Resolve this error
-
+- Resolve this error:
 - DeprecationWarning: *scattermapbox* is deprecated! Use *scattermap* instead. Learn more at: https://plotly.com/python/mapbox-to-maplibre/     fig.add_trace(go.Scattermapbox(
-
-### Resolve this error
-
+- Resolve this error:
 - DeprecationWarning: The 'generic' unit for NumPy timedelta is deprecated, and will raise an error in the future. This includes implicit conversion of bare integers (e.g. `+ 1`).Please use a specific unit instead.
 - start_time = gun_time - pd.Timedelta(minutes=5)
 - Add a password page that you have to put in before you can view the main website.
@@ -231,9 +238,10 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.7.2
 
+
 ### Notes
 
-- Changes implemented and password configured outside the repository
+- Changes implemented and password set to [REDACTED]
 
 ### Changes to make
 
@@ -241,6 +249,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - Change folder structure so the data is contained in a “/data” sub folder instead of with the app.
 
 ## 0.7.3
+
 
 ### Notes
 
@@ -251,6 +260,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - The VMG percentage (VMG_PCT) is now not showing. Ensure this value is calculated if missing using the uploaded polar file and available to plot.
 
 ## 0.7.4
+
 
 ### Notes
 
@@ -263,7 +273,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - Note that app is just called “app.py” now. Version is saved within the file as an “App Version” info.
 - Deployed onto Railway.
 - Website forwards to Railway webpage for data.
-- Password protected, “Nightjar2026!”.
+- Password protected, [REDACTED].
 - BP TO ADD NOTES ON DATA UPLOAD.
 
 ### Changes
@@ -274,19 +284,19 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.7.5
 
+
 ### Notes
 
 - Changes implemented, still not running due to out of memory error. Will need to run much more efficiently.
 - Changing the “logfile” by running a pre-processing script on it to remove excess columns.
 - Running the cleaner on the file reduced its size from 230 MB to 178 MB. Will try uploading now and see if the website will run.
-
-### App still has the memory error so
-
+- App still has the memory error so:
 - I will change the script to load the data in chunks, so that it doesn’t exceed the memory limits.
 
 ## 0.7.6
 
-### Notes
+
+### Notes.
 
 - Changed so that input is read 25000 rows at a time to reduce memory useage.
 - I think this is now working. Memory useage is still high.
@@ -302,6 +312,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.7.7
 
+
 ### Notes
 
 - Above changes requested.
@@ -315,11 +326,13 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.7.8
 
+
 ### Notes
 
 - Above changes implemented.
 
-## 0.7.8.1 Verison – Error Fix in code
+### 0.7.8.1 Verison – Error Fix in code.
+
 
 ### Changes
 
@@ -332,7 +345,9 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.7.9
 
+
 ### Notes
+
 
 ### Changes
 
@@ -352,7 +367,9 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## UPDATES ONCE OPERATIONAL
 
+
 ## 8.1.0
+
 
 ### Notes
 
@@ -362,14 +379,15 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ### Changes
 
-### Note that up until this version the custom start command on railway was
-
+- Note that up until this version the custom start command on railway was:
 - python -m streamlit run app.py --server.address=0.0.0.0 --server.port=8080 --server.headless=true --browser.gatherUsageStats=false
 - This has now changed with the Java deployment.
 
 ## Change to Java from Streamlit
 
+
 ## 0.9.0
+
 
 ### 0.9.0 Objectives
 
@@ -394,6 +412,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.9.1
 
+
 ### Notes
 
 - Failed on first build. Going through minor changes.
@@ -406,81 +425,59 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.9.2
 
+
 ### Notes
 
 - Java version now working. Now trying to re-implement the lost functionality.
-
-### Requests
-
-### General
-
+- Requests:
+- General:
 - Change the script to reload the Nightjar logo into the top left of the main page.
 - Also have it in at the top center of the password page.
 - Colour scheme is now all orange. Change back to the blue colour scheme from Streamlit versions with only selected items being orange.
 - Add back in filter by inshore or offshore when selecting events.
 - Move the Event selection to the top of the left hand panel. With the input files section below it.
-
-### On all pages with plots
-
+- On all pages with plots:
 - Add “colour by tack” option back to polar, variable plotting, and gps page.
 - Add “Colour by event” option back to above pages.
 - Add a time averaging to the plots on each page. Within the time averaging allow the user to select a maximum variation in the plotted variables
 - Change default colour scales in all plots to blue to red, not white to red as at present.
-
-### Polar Plot
-
+- Polar Plot:
 - Half polar view plotting from -90 to 90, should plot 0 to 180.
 - Add selection to show full polar plot (so showing both tacks) or showing ½ polar (plotting abs(twa)) also have an option to plot in cartesian space.
-
-### gps Plot
-
+- gps Plot:
 - always show in the tooltip: TWS, TWA, BSP, Heel, as well as the value of the variables being plotted.
-
-### Settings Page
-
+- Settings Page:
 - Move “save settings” button to top of page.
 
 ### Changes
 
-### General
-
+- General:
 - Remove sign out button from left hand pane.
 - Make left hand panel hide-able
 - Change Style to dark blue background with light text.
 - Use orange for selected values.
 - For the plots colouring by tack or event, make these switches on the page instead of a drop down selection. Enforce when 1 is switched on the other is switched off (if it is on).
-
-### Figure downsampling warning
-
+- Figure downsampling warning:
 - Add note to say where to turn off.
 - Update it to the actual number of samples.
 - Remove the “sign out” box from top right.
-
-### Polar Page
-
+- Polar Page:
 - Half polar still plotting -90 to 90. Plot 0 to 90.
 - When doing full polar plot target polar on both sides.
-
-### Sail Selection Page
-
+- Sail Selection Page:
 - Plot from 0 to 180 deg.
 - Add option for catesian plotting.
-
-### Variable Plot
-
+- Variable Plot:
 - Add axis labels.
 - Add option to plot absolute values only.
 - Add text box option to set axis limits.
-
-### GPS Page
-
+- GPS Page:
 - Start with the plot zoomed to the extents of the data only.
-
-### Settings page
-
+- Settings page:
 - Add an option for selecting variable to “Select only used” set it to this by default.
 
 ## 0.9.3
+
 
 ### Notes
 
@@ -498,57 +495,59 @@ This changelog records releases, fixes, implementation notes and planned work fo
 
 ## 0.9.4
 
+
 ### Notes
 
 - Working well
 
-### 0.9.4.1 Minor revision to fix issues
+### 0.9.4.1 Minor revision to fix issues.
 
-## 0.9.5 – File Structure Change
+
+## 0.9.5 – File Structure Change.
+
 
 ### Info:
 
-### File structure now
-
+- File structure now:
 - nightjar-data-analysis-0.9.5/
-    ├── CHANGELOG.md
-    ├── README.md
-    ├── pom.xml
-    └── src/
-    └── main/
-    ├── java/
-    │   └── com/
-    │       └── nightjar/
-    │           └── analysis/
-    │               ├── NightjarApplication.java
-    │               └── WebController.java
-    └── resources/
-    ├── application.properties
-    └── static/
-    ├── index.html
-    ├── styles.css
-    ├── js/
-    │   ├── app.js
-    │   ├── api.js
-    │   ├── state.js
-    │   ├── common.js
-    │   ├── overview.js
-    │   ├── polar.js
-    │   ├── sail-selection.js
-    │   ├── map-view.js
-    │   ├── variable-plot.js
-    │   ├── files.js
-    │   └── settings.js
-    └── pages/
-    ├── header.html
-    ├── sidebar.html
-    ├── overview.html
-    ├── polar.html
-    ├── sail-selection.html
-    ├── map-view.html
-    ├── variable-plot.html
-    ├── files.html
-    └── settings.html
+- ├── CHANGELOG.md
+- ├── README.md
+- ├── pom.xml
+- └── src/
+- └── main/
+- ├── java/
+- │   └── com/
+- │       └── nightjar/
+- │           └── analysis/
+- │               ├── NightjarApplication.java
+- │               └── WebController.java
+- └── resources/
+- ├── application.properties
+- └── static/
+- ├── index.html
+- ├── styles.css
+- ├── js/
+- │   ├── app.js
+- │   ├── api.js
+- │   ├── state.js
+- │   ├── common.js
+- │   ├── overview.js
+- │   ├── polar.js
+- │   ├── sail-selection.js
+- │   ├── map-view.js
+- │   ├── variable-plot.js
+- │   ├── files.js
+- │   └── settings.js
+- └── pages/
+- ├── header.html
+- ├── sidebar.html
+- ├── overview.html
+- ├── polar.html
+- ├── sail-selection.html
+- ├── map-view.html
+- ├── variable-plot.html
+- ├── files.html
+- └── settings.html
 
 ### 0.9.5.1
 
@@ -569,13 +568,9 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - Why does the map always start zoomed out. Can it zoomed to the extents of the plot.
 - Colour by tack doesn’t work consistently. It also draws straight lines between the tacks the opposite colour to the tack. Remove these lines
 - Add colour scale limits to the Variable plot and map view colour scales.
-
-### Move this to bottom of left hand panel. Separate each statement onto a new line
-
+- Move this to bottom of left hand panel. Separate each statement onto a new line:
 - Add ability to average y between 2 x values on variable plot.
-
-### Immediate
-
+- Immediate:
 - Correct error in reading in eventdata and testdata files
 - Resolve error why no “Gun” entries are being found in the event data file and no rows past 500 ish (7th August) are loading.
 - Rounding in tool tip (again)
@@ -583,15 +578,11 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - Change colour scheme for scale bars to be more high contrast.
 - Allow adjustable limits on colour bar scale.
 - Deal with BST Correctly.
-
-### Performance
-
+- Performance:
 - Add ability to compute n th percentage polar based on available information and compare to the current polar.
 - Use the same TWA as the current polar, and compute based on selected data. Allow user to choose the n’th percentile and also the tolerances on TWS and TWA that are included around each data point for the polar. Also include a cut off of x % above the calculated value and y % below it to remove any outlying data.
 - Add variable plot and map in a side-by-side view on a new tab.
-
-### File handling
-
+- File handling:
 - Add ability to upload new files, compare to the existing datafiles in the volume and append any new information in them (instead of having to upload whole new files to the volume).
 - Also add for the website to check for updated files in the volume and reload data when they’re changed.
 - Add ability to upload and save Ms word / google sheet debrief documents into the web page and view them.
@@ -599,9 +590,7 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - Add ability to store rig information / to do list in the website.
 - Can we link these files to a google drive folder?
 - CHANGE THE PASSWORD.
-
-### Later
-
+- Later:
 - Would be good to implement a SQL database or similar to store the data instead of storing it as part of the memory.
 - Also need to write up notes on how to change files I the railway volume.
 - compare actual sailing data against target polars,
@@ -609,3 +598,17 @@ This changelog records releases, fixes, implementation notes and planned work fo
 - update sail selection charts,
 - add notes/events,
 - save analysis sessions and export useful outputs
+
+## Additional available Markdown release history
+
+#### 0.9.5.4
+- Restructured the 0.9.4 static web content into page fragments and page-specific JavaScript files.
+- No intended functional changes.
+
+### 0.9.4
+- Added continuous colour scale bars to Map View, Variable plot and Polar plots.
+- Made Plotly canvas backgrounds transparent against a darker plot shell.
+- Fixed tack colours: port/negative TWA red; starboard/positive TWA green.
+- Moved the sidebar control inline with the tabs and renamed GPS to Map View.
+- Preferentially maps VMG_PCT from Expedition VMG%.
+- Added filtered EventData/TestData viewer and TestData upload/volume loading.
