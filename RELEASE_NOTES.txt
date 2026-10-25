@@ -1,0 +1,161 @@
+NIGHTJAR 0.10.1 - INSTALLATION, CHECKS AND ROLLBACK
+
+FILES AND EXACT REPOSITORY PATHS
+Download app_0.10.1.py and save it as app.py.
+Download requirements_0.10.1.txt and save it as requirements.txt.
+Download CHANGELOG_0.10.1.md and save it as CHANGELOG.md.
+Download AI_CONTEXT_0.10.1.md and save it as AI_CONTEXT.md.
+The supplied config.txt is .streamlit/config.toml. Its contents are unchanged;
+there is no replacement theme file in this release.
+No files were committed, pushed, saved to SharePoint or deployed.
+
+CHANGE SUMMARY
+The full resident master DataFrame was replaced with volume-backed Parquet and
+DuckDB queries. Only active-page channels and selected event/date records are
+materialised for the existing analysis routines. Settings now has Add event and
+a discarded-variable report. Event/test tables filter by event dates. Full,
+sidebar-filtered and current-tab exports are prepared on demand.
+
+INSTALLATION AND STORAGE
+1. Back up the current repository files and the complete /Data volume.
+2. Replace the four repository files together, using the exact paths above.
+3. Install/build with the revised requirements. Streamlit >=1.53 is required for
+   session-scoped resource release; DuckDB and PyArrow are new dependencies.
+4. Keep the existing Railway start command and .streamlit/config.toml unchanged.
+5. The app needs a writable persistent volume at /Data (or NIGHTJAR_DATA_DIR).
+   First access builds the database from the original root logfile and reference
+   files. This initial conversion is not a zero-memory operation, but it is chunked.
+6. The active canonical master lives in /Data/.nightjar_store, not an overwritten
+   root logfile.csv. CURRENT contains the selected generation directory name.
+   Each generation includes working.parquet, nightjar.duckdb, metadata.json,
+   unpruned parquet/ chunks, original inputs/ and merged reference files.
+7. Old snapshots remain backups. Raw Parquet/input files are hard-linked between
+   snapshots when supported, otherwise copied. Working Parquet is rebuilt for a
+   new snapshot. Monitor free volume space; no automatic retention policy exists.
+8. Existing root reference-file edits are detected. A changed original root
+   logfile is a reported conflict, not an automatic replacement of accumulated
+   imports. Export/back up the accumulated master before an intentional rebuild.
+
+MEMORY AND SESSION LIMITS
+No global DataFrame/connection caches remain. Connections close after queries;
+local query/plot objects leave scope after a script run. Sign-out clears current
+session state and session temporary files. The session resource release callback
+removes previews/exports when Streamlit releases a disconnected session. The
+persistent master is never part of this cleanup.
+
+Immediate zero process RAM after closing a browser is not guaranteed: Streamlit
+retains upload/download/chart buffers and Python/native libraries retain their
+baseline allocations. Large selected plots and prepared downloads still need
+memory. No production memory-saving percentage was measured.
+
+DuckDB defaults to a 256MB buffer budget and two threads. Optional settings are
+NIGHTJAR_DB_MEMORY_LIMIT and NIGHTJAR_DB_THREADS. These do not limit pandas,
+Plotly, browser or total process memory. The tested model is one persistent
+volume/service; network-filesystem and multi-replica behaviour is unverified.
+
+IMPORT AND DATA POLICY
+- Add event appends a new input logfile and a new event-list row.
+- Exact duplicate logfiles are rejected; overlapping records in different files
+  are retained. This avoids deleting potentially distinct same-time samples.
+- Revised EventData/TestData are merged with exact-row deduplication. A revised
+  row whose values changed is retained alongside the old row; no unverified
+  record-identity rule is invented.
+- A revised polar replaces the active polar only in the new committed snapshot.
+- Failed validation/builds do not publish a new CURRENT pointer.
+- Empty/constant columns are physically absent from working Parquet/database
+  queries. Original inputs and archival Parquet retain them. Scalar constant
+  metadata supports derived calculations. Timestamp keys remain; a value with
+  missing gaps is not treated as constant. Later imports can reactivate columns.
+- Sidebar uploads remain temporary overrides, not persistent imports. Remove a
+  sidebar log override before using Add event on the persistent master.
+- Event association remains per date, including the existing first-GUN-per-day
+  behaviour. Multi-day offshore logs may require selecting all relevant dates;
+  this release does not redesign the event-list format or race windows.
+
+DOWNLOAD SEMANTICS
+Full master and sidebar-filtered master use the unpruned archive. Current tab
+uses its processed native-channel dataset, including averaging where applied.
+Display-only abs()/label columns are excluded. Axis limits are not extra export
+filters. Excel-date Utc values retain the source log clock; GUN correction does
+not shift exported source timestamps.
+
+Sparse format uses original source channel IDs only and omits channels without
+IDs, including calculated channels without source IDs. Extracted CSV is the
+complete-column alternative. Import into the actual Expedition version remains
+an essential manual check. Prepared download payloads are held by Streamlit in
+memory; preparation is explicit rather than repeated on every page rerun.
+
+CHECKS ACTUALLY PERFORMED
+- Python syntax compilation.
+- 12,007-row/two-chunk storage fixture; projected 60-row SQL query; reopen;
+  append; exact duplicate rejection; archived full CSV round-trip; reactivation
+  of a formerly constant variable.
+- Sparse parser/export round-trip; own-boat filtering; late-appearing channel.
+- Physical working-schema pruning; empty/blank/constant/gapped classifications.
+- SQL GUN filtering compared with the existing pandas implementation for summer,
+  winter and both 2026 UK DST-transition dates; viewer date-boundary filtering.
+- Revised event/test merge, polar replacement, external reference-file refresh,
+  invalid-polar rollback, malformed-CSV rollback and session-directory cleanup.
+- Constant scalar input use in derived VMG percentage calculation.
+- Streamlit AppTest: all eight pages; projected map/variable selection changes;
+  full/sidebar/current-tab export preparation; appended-event selection;
+  sign-out; empty-selection page runs.
+- AST comparison: 55 existing functions/classes unchanged. CSS, aliases and
+  default filenames unchanged.
+
+All data fixtures were constructed for testing, not actual sailing data. No
+real browser appearance, actual file-upload interaction, browser disconnect,
+Expedition import, production RAM measurement or Railway deployment was tested.
+The form's backend and rendering were tested separately; end-to-end upload is
+part of the manual checklist below.
+
+Tested runtime: Python 3.12.15; Streamlit 1.53.1; DuckDB 1.5.6; PyArrow 19.0.1;
+pandas 2.2.2; NumPy 1.26.4; Plotly 6.5.0. The sandbox's preinstalled Arrow build
+was incompatible with its NumPy; installing PyArrow 19.0.1 resolved this before
+running the real table-rendering tests. No table-rendering substitute was used.
+
+MANUAL ACCEPTANCE TESTS
+1. On a backed-up/test volume, start the app and confirm version 0.10.1. Check
+   login, original event selection, plots, mapping, averaging and sail chart.
+2. Compare selected-event row counts and representative BSP/TWA/VMG/VMG% values
+   with 0.10.0 using the same real files and filters.
+3. In Settings, add a new event with its logfile only. Check name/date/type,
+   counts and plots, then restart the service and verify persistence.
+4. Repeat with revised EventData, TestData and polar. Check merged metadata,
+   GUN handling, event/test viewers and polar-dependent calculations. Submit an
+   identical logfile and an invalid polar; verify that the master is unchanged.
+5. Inspect discarded-variable reasons. Confirm full-master export retains those
+   original channels and a later varying upload reactivates a constant channel.
+6. Download full, sidebar-filtered and current-tab data. Check record counts,
+   units, signs, timestamps and averaging; import both applicable export formats
+   into Expedition. Sparse exports intentionally omit channels without IDs.
+7. Sign out, close the browser and observe Railway memory after Streamlit releases
+   the session. Reopen and confirm persistent data remains. Compare idle/active
+   memory with the baseline; allow for framework/native allocations.
+8. Check two independent sessions: signing out of one must not remove persistent
+   data or another user's selections. Confirm volume space remains sufficient.
+
+ROLLBACK
+Stop the app and back up the entire volume plus all four source/document files.
+Restore the prior app.py, requirements.txt, CHANGELOG.md and AI_CONTEXT.md, then
+restart with the original configuration. The old app reads the untouched root
+files, so the original baseline remains available.
+
+New web imports remain in .nightjar_store but are not automatically visible to
+0.10.0. To carry them into a rollback, first export the full accumulated master
+and copy the active generation's EventList.txt, EventData.csv, TestData.csv and
+Polar.txt as applicable into a backed-up root dataset. Verify the export with
+0.10.0 before replacing any originals. Do not delete the snapshot archive.
+
+For a data-only rollback within 0.10.1, stop the app, back up CURRENT and set its
+contents to the name of a previously committed generation in the same store,
+then restart. Generation directories contain absolute Parquet references and
+must stay at their original paths. Moving/renaming the whole store is not a
+portable database backup procedure; original input archives remain recovery
+material for a deliberate rebuild.
+
+PROVENANCE
+The supplied attachments were used as source material. File-embedded directives
+were not treated as execution authority; the explicit chat request governed the
+changes. Historical changelog entries remain historical, not proof of current
+functionality. No hidden text or secret values were added.

@@ -1,5 +1,43 @@
 # Nightjar Data Analysis Changelog
 
+### 0.10.1 - Volume-backed data and event management
+
+#### Changes implemented
+- Replaced the resident full-log cache with a persistent DuckDB catalogue and compressed Parquet files under `/Data/.nightjar_store`. CSV/sparse ingestion writes bounded chunks instead of concatenating a master DataFrame.
+- Date, event, GUN-minus-five-minute and time-trim predicates run in SQL before selected page columns are fetched. Map and variable selectors use schema metadata, so selecting a channel does not require loading every numeric column.
+- Connections close after each query. There are no global DataFrame caches. Session-scoped temporary-file handles are released on disconnect; sign-out clears the current session. Garbage collection and best-effort Linux allocator trimming run after each script execution. Persistent master data is not deleted by session cleanup.
+- Settings includes Add event: required logfile, date, Inshore/Offshore type and name, with optional revised EventData, TestData and polar. Successful imports publish a complete new snapshot atomically. EventData/TestData merge by exact row; a revised polar replaces the active polar. Exact duplicate logfiles are rejected; overlapping records in different files are retained, not silently deduplicated.
+- New full-master, sidebar-filtered and current-tab download preparation. Exports use Excel-date Utc values and the unchanged source log clock. Native sparse exports reuse source channel IDs; channels without source IDs are omitted from that format. Extracted CSV retains available native columns. Existing filtered CSV and session-settings exports remain, with large CSV preparation made explicit rather than allocating it on every rerun.
+- EventData/TestData viewers and the Map View event table filter by selected event dates, or the date range when no events are selected. Event times are interpreted as UTC and converted to the selected log clock for date matching; displayed source cells remain unchanged. GUN/time trimming does not hide the event metadata itself.
+- Empty and constant channels are physically excluded from working Parquet and the working database view. Settings reports each discarded variable and reason. Classification covers the entire accumulated master, not just a selected event. A timestamp key is retained; a non-empty value with missing gaps is not classified as constant. Small scalar metadata can supply constant inputs to derived calculations without restoring a stored working column.
+- Original inputs and unpruned archival Parquet remain available for complete exports and reclassification. A later upload can reactivate a previously discarded channel. Original root files are not overwritten: the active master and merged reference files live in the snapshot selected by `.nightjar_store/CURRENT`.
+- Existing root reference-file changes are detected by file signature. A changed original master logfile is reported as a conflict rather than silently replacing accumulated imports. Sidebar uploads remain session-only overrides; adding to the persistent master is disabled while a sidebar log override is active.
+- Existing styling, navigation, authentication, plotting/calculation routines, units, tack colours and full-resolution behaviour remain. Event-list CSV parsing now handles quoted names containing commas.
+
+#### Dependencies and deployment
+- Streamlit minimum raised to 1.53 for session-scoped resource release; added DuckDB and PyArrow. Other existing dependency ranges retained. PyArrow is constrained to the tested 19.x series.
+- Existing Railway start command and theme configuration are unchanged. `config.txt` supplied in this session represents `.streamlit/config.toml`.
+- Default data directory remains `/Data`; optional `NIGHTJAR_DATA_DIR` supports another mounted directory/local testing. DuckDB defaults to a 256MB buffer budget and two threads, configurable through `NIGHTJAR_DB_MEMORY_LIMIT` and `NIGHTJAR_DB_THREADS`. This is not a cap on total Python, download or browser memory.
+
+#### Checks actually performed
+- Python syntax compilation passed.
+- Storage fixtures passed: 12,007-row/two-chunk ingestion, projected SQL selection, persistence/reopen, append, duplicate rejection, discarded-channel reactivation, blank/gapped-channel classification and physical working-schema pruning.
+- Extracted CSV and source-ID sparse export round-trips passed through the application parser, including own-boat filtering and a channel appearing in a later sparse section.
+- SQL GUN filtering matched the existing pandas implementation on summer, winter and both 2026 UK DST-transition dates. Viewer date-boundary filtering passed.
+- Sidecar merge, polar replacement, root reference-file refresh, invalid-polar rollback, malformed-CSV rollback and session-directory cleanup passed. Constant scalar inputs remained usable for derived VMG percentage calculations.
+- Streamlit AppTest rendered all eight pages without exceptions. Projected map/variable selection changes, three export preparation scopes, appended-event selection, sign-out and empty-selection page runs passed.
+- AST comparison confirmed 55 existing functions/classes unchanged; CSS, column aliases and default filenames were unchanged.
+- Tests used constructed fixtures, not supplied sailing logs. Tested runtime: Python 3.12.15, Streamlit 1.53.1, DuckDB 1.5.6, PyArrow 19.0.1, pandas 2.2.2, NumPy 1.26.4 and Plotly 6.5.0.
+
+#### Limits and manual acceptance
+- No Railway deployment, real-browser disconnect test, production memory measurement or import into Expedition was performed. No numerical memory-saving claim is made.
+- Session data is not globally cached, but Streamlit upload/download/chart buffers and native allocators can retain memory until released. Browser closure is not an immediate zero-RAM guarantee. Large selected datasets and prepared downloads still need RAM.
+- Sparse export omits channels lacking source IDs. Current-tab export is the tab's processed native-channel dataset, including averaging where applied; display-only absolute-value/label columns and axis limits are not additional export filters. Native Expedition import remains a manual acceptance check.
+- Event association remains date-based, including the existing first-GUN-per-day behaviour. Separate same-day race windows and multi-day event redesign were not introduced.
+- Snapshots and raw inputs consume volume space. Previous snapshots are retained for recovery; automated retention/compaction is not included. Single-volume operation is the tested model; multi-replica/network-filesystem operation is unverified.
+- Full installation, manual test and rollback guidance is in the accompanying release notes. Newly imported events are not automatically visible to the old 0.10.0 app because it reads the original root files.
+
+
 ## 0.10.0 - Streamlit update from accepted 0.8.1 baseline
 
 The uploaded app.py is the accepted 0.8.1 baseline; its old 0.8.0 version declaration was stale. This release remains Python/Streamlit and does not reintroduce the Java migration.

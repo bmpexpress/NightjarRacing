@@ -1,5 +1,7 @@
 from __future__ import annotations
-import csv, gc, hashlib, hmac, io, json, math, os, re
+import csv, gc, hashlib, hmac, io, json, math, os, re, shutil, threading, uuid
+from contextlib import contextmanager
+import duckdb
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, time, UTC
@@ -13,7 +15,7 @@ import streamlit as st
 NIGHTJAR_ORANGE = "#f28c28"
 NIGHTJAR_ORANGE_RGBA = "rgba(242,140,40,0.58)"
 
-APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.10.0"
+APP_TITLE, APP_VERSION = "Nightjar Data Analysis", "0.10.1"
 DEFAULT_FILES = {
     "log":"logfile.csv",
     "polar":"Polar.txt",
@@ -25,7 +27,8 @@ DEFAULT_FILES = {
 }
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path("/Data")
+DATA_DIR = Path(os.environ.get("NIGHTJAR_DATA_DIR", "/Data"))
+_STORE_LOCK = threading.RLock()
 ALIASES = {
     "timestamp":["utc","time","timestamp","datetime"],
     "bsp":["bsp","boat speed","log bsp"],
@@ -172,65 +175,20 @@ def optimise_dtypes(df, categorise_text=False):
 
 
 
-def local_cache_path_for(path):
-    p = Path(path)
-    stat = p.stat()
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.stem)
-    return p.with_name(f".{safe}_{stat.st_size}_{stat.st_mtime_ns}_nightjar_0100_full.parquet")
-
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def parse_events_cached(raw): return parse_events(io.BytesIO(raw))
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def parse_event_list_cached(raw): return parse_event_list(io.BytesIO(raw))
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def parse_polar_cached(raw): return parse_polar(io.BytesIO(raw))
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def parse_sails_cached(raw): return parse_sails(io.BytesIO(raw))
-
-
-@st.cache_resource(show_spinner=False, max_entries=1)
-def load_local_log_resource(path_string, file_size, modified_ns):
-    """Hold one shared local log between reruns, without cache_data copies."""
-    p = Path(path_string); cache = local_cache_path_for(p)
-    if cache.exists() and cache.stat().st_mtime_ns >= modified_ns:
-        try: return optimise_dtypes(pd.read_parquet(cache), categorise_text=True)
-        except Exception: pass
-    df = optimise_dtypes(parse_log(p))
-    try:
-        df.to_parquet(cache, index=False, compression="zstd")
-    except (ImportError, OSError, ValueError, TypeError):
-        pass  # Parquet is an optional acceleration, never a prerequisite.
-    gc.collect(); return df
-
-
-def load_log_fast(src):
-    """Load a local log once; parse uploads directly without copying bytes."""
-    if isinstance(src, (str, Path)):
-        p=Path(src); stat=p.stat()
-        return load_local_log_resource(str(p.resolve()), stat.st_size, stat.st_mtime_ns)
-    try: src.seek(0)
-    except Exception: pass
-    return optimise_dtypes(parse_log(src))
-
-
 def load_events_fast(src):
-    return parse_events_cached(read_bytes(src)) if src else pd.DataFrame()
+    return parse_events(src) if src else pd.DataFrame()
 
 
 def load_event_list_fast(src):
-    return parse_event_list_cached(read_bytes(src)) if src else pd.DataFrame(columns=["date", "type", "event"])
+    return parse_event_list(src) if src else pd.DataFrame(columns=["date", "type", "event"])
 
 
 def load_polar_fast(src):
-    return parse_polar_cached(read_bytes(src)) if src else None
+    return parse_polar(src) if src else None
 
 
 def load_sails_fast(src):
-    return parse_sails_cached(read_bytes(src)) if src else pd.DataFrame()
+    return parse_sails(src) if src else pd.DataFrame()
 
 def detect_columns(df):
     cols = {norm(c): c for c in df.columns}; out = {}
@@ -376,7 +334,7 @@ def _text_stream(src):
     return io.TextIOWrapper(src, encoding="utf-8-sig", errors="replace", newline=""), False
 
 
-def parse_sparse_stream(src, chunk_rows=None):
+def parse_sparse_stream(src, chunk_rows=None, collector=None):
     """Parse sparse Expedition logs in bounded, column-oriented blocks.
 
     Column lists avoid retaining thousands of per-row Python dictionaries. New
@@ -387,7 +345,7 @@ def parse_sparse_stream(src, chunk_rows=None):
         5000,
         int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "12000")),
     )
-    collector = _FullLogCollector()
+    collector = collector if collector is not None else _FullLogCollector()
     handle, close_handle = _text_stream(src)
     reader = csv.reader(handle)
     names = None
@@ -482,11 +440,11 @@ def _is_sparse_log(src):
     return len(lines) == 2 and lines[0].startswith("!") and lines[1].lower().startswith("!boat")
 
 
-def parse_standard_stream(src, chunk_rows=None):
+def parse_standard_stream(src, chunk_rows=None, collector=None):
     """Read a conventional CSV sequentially and retain a RAM-bounded frame."""
     chunk_rows = max(5000, int(chunk_rows or os.environ.get("NIGHTJAR_LOG_CHUNK_ROWS", "12000")))
-    collector = _FullLogCollector()
-    kwargs = dict(chunksize=chunk_rows, low_memory=True, on_bad_lines="warn")
+    collector = collector if collector is not None else _FullLogCollector()
+    kwargs = dict(chunksize=chunk_rows, low_memory=True, on_bad_lines="error" if isinstance(collector, ParquetCollector) else "warn")
     if isinstance(src, (str, Path)):
         kwargs["memory_map"] = True
     try:
@@ -630,7 +588,7 @@ def parse_event_list(src):
     for line in decode(src).splitlines():
         if not line.strip():
             continue
-        parts = [p.strip().strip('"') for p in line.split(",")]
+        parts = [p.strip() for p in next(csv.reader([line]))]
         if len(parts) < 3:
             # Need date, event type and event name.
             continue
@@ -1044,7 +1002,7 @@ def enabled_variables(columns):
 def render_settings(df, mapping, keys):
     st.subheader("Settings")
     st.subheader("Plotting performance")
-    st.info("Full-resolution loading and plotting: no automatic downsampling, row caps or application RAM/download budgets. Only the active page is rendered. Server and browser capacity still apply.")
+    st.info("Volume-backed Parquet + DuckDB: selected dates and active-page channels are queried. No master DataFrame is cached. Full-resolution plotting is preserved; large selections and prepared downloads still require server/browser memory.")
     st.subheader("GUN time correction")
     zone = st.session_state.get("nightjar_log_timezone", "Europe/London")
     st.selectbox("Log timestamp clock", ["Europe/London", "UTC"],
@@ -1321,7 +1279,514 @@ h1,h2,h3,h4,h5,h6,p{ text-align:center; }
     return False
 
 
-def render_file_viewer(src):
+
+# Volume-backed storage, introduced in 0.10.1.
+def _qi(value):
+    return '"' + str(value).replace('"', '""') + '"'
+def _qs(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+@contextmanager
+def volume_lock(root):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    with _STORE_LOCK:
+        with (root / 'store.lock').open('a+b') as handle:
+            if os.name == 'nt':
+                import msvcrt
+                handle.seek(0)
+                if not handle.read(1):
+                    handle.write(b'0'); handle.flush()
+                handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == 'nt':
+                    handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+def save_source(source, target):
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(source, (str, Path)):
+        shutil.copyfile(source, target)
+    else:
+        source.seek(0)
+        with target.open('wb') as handle:
+            shutil.copyfileobj(source, handle, length=1024 * 1024)
+        source.seek(0)
+    return target
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+def release_process_memory():
+    gc.collect()
+    if os.name == 'posix':
+        try:
+            import ctypes
+            trim = getattr(ctypes.CDLL(None), 'malloc_trim', None)
+            if trim is not None:
+                trim(0)
+        except (OSError, AttributeError):
+            pass
+
+class SessionFiles:
+    def __init__(self):
+        self.path = DATA_DIR / '.nightjar_sessions' / uuid.uuid4().hex
+        self.path.mkdir(parents=True, exist_ok=True)
+    def close(self):
+        shutil.rmtree(self.path, ignore_errors=True)
+        release_process_memory()
+
+@st.cache_resource(scope='session', on_release=lambda files: files.close(), show_spinner=False)
+def session_files():
+    # Cache only a small path handle. No DataFrames or DB connections are cached.
+    return SessionFiles()
+
+class ParquetCollector:
+    def __init__(self, folder, first_row=0):
+        self.folder = Path(folder)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.input_rows = 0
+        self.next_row = first_row
+        self.parts = []
+    def add(self, chunk):
+        chunk = _process_log_chunk(chunk)
+        if chunk is None or chunk.empty:
+            return
+        if any(str(c).startswith('_nj_') for c in chunk.columns):
+            raise ValueError('Input names beginning _nj_ are reserved.')
+        chunk['_nj_row'] = np.arange(self.next_row, self.next_row + len(chunk), dtype=np.int64)
+        part = self.folder / (uuid.uuid4().hex + '.parquet')
+        chunk.to_parquet(part, index=False, compression='zstd')
+        self.parts.append(part)
+        self.input_rows += len(chunk)
+        self.next_row += len(chunk)
+    def finish(self):
+        if not self.input_rows:
+            raise ValueError('The log contains no valid own-boat records.')
+        return self.parts
+
+def source_channel_ids(path):
+    result, names = {}, None
+    handle, close = _text_stream(path)
+    try:
+        for fields in csv.reader(handle):
+            if len(fields) < 2:
+                continue
+            if fields[0].strip().lower() == '!boat' and fields[1].strip().lower() == 'utc':
+                names = fields
+            elif fields[0].strip().lower() == '!boat' and names and len(names) == len(fields):
+                for name, channel in zip(names[2:], fields[2:]):
+                    if channel.strip().lstrip('+-').isdigit():
+                        name, channel = name.lstrip('!').strip(), channel.strip()
+                        if name in result and result[name] != channel:
+                            raise ValueError(f'Conflicting channel ID for {name}.')
+                        result[name] = channel
+    finally:
+        if close:
+            handle.close()
+    return result
+
+class VolumeLog:
+    def __init__(self, root, generation, preview=False):
+        self.root = Path(root)
+        self.folder = self.root / generation
+        self.preview = preview
+        self.meta = json.loads((self.folder / 'metadata.json').read_text())
+        self.columns = list(self.meta['working_columns'])
+    @contextmanager
+    def connection(self):
+        with volume_lock(self.root):
+            con = duckdb.connect(str(self.folder / 'nightjar.duckdb'), read_only=True)
+            try:
+                configure_database(con, self.folder)
+                yield con
+            finally:
+                con.close()
+    def schema_frame(self):
+        with self.connection() as con:
+            return con.execute('SELECT * EXCLUDE (_nj_row) FROM working_log LIMIT 0').fetchdf()
+    def bounds(self, timestamp):
+        if not timestamp:
+            return None, None
+        with self.connection() as con:
+            return con.execute(f'SELECT min({_qi(timestamp)}), max({_qi(timestamp)}) FROM working_log').fetchone()
+    def query(self, columns, where='TRUE', parameters=()):
+        constants = self.meta.get('constants', {})
+        columns = list(dict.fromkeys(c for c in columns if c and (c in self.columns or c in constants)))
+        if not columns:
+            return pd.DataFrame()
+        ts = self.meta.get('timestamp')
+        order = (_qi(ts) + ' NULLS LAST, ') if ts else ''
+        expressions = []
+        for column in columns:
+            if column in self.columns:
+                expressions.append(_qi(column))
+            else:
+                value = constants[column]
+                expressions.append('CAST(' + _qs(value['value']) + ' AS ' + value['type'] + ') AS ' + _qi(column))
+        sql = 'SELECT ' + ','.join(expressions) + ' FROM working_log WHERE ' + where + ' ORDER BY ' + order + '_nj_row'
+        with self.connection() as con:
+            return optimise_dtypes(con.execute(sql, list(parameters)).fetchdf())
+    def count(self, where='TRUE', parameters=()):
+        with self.connection() as con:
+            return con.execute('SELECT count(*) FROM working_log WHERE ' + where, list(parameters)).fetchone()[0]
+    def sidecar(self, key):
+        path = self.folder / DEFAULT_FILES[key]
+        return path if path.exists() else None
+
+def configure_database(con, folder):
+    con.execute('SET memory_limit = ' + _qs(os.environ.get('NIGHTJAR_DB_MEMORY_LIMIT', '256MB')))
+    con.execute('SET threads = ' + str(max(1, int(os.environ.get('NIGHTJAR_DB_THREADS', '2')))))
+    con.execute('SET preserve_insertion_order = false')
+    con.execute('SET temp_directory = ' + _qs(str(Path(folder) / 'spill')))
+
+def create_snapshot(root, previous=None, new_log=None, sidecars=None, event=None, baseline=None, merge_sidecars=True, external_signatures=None):
+    # Caller holds volume_lock. Publish CURRENT only after every file is valid.
+    root = Path(root)
+    generation = 'generation_' + uuid.uuid4().hex
+    folder = root / generation
+    folder.mkdir(parents=True)
+    meta = {'version': APP_VERSION, 'inputs': [], 'channel_ids': {}, 'baseline': baseline}
+    try:
+        parts_dir, inputs_dir = folder / 'parquet', folder / 'inputs'
+        parts_dir.mkdir(); inputs_dir.mkdir()
+        first_row = 0
+        if previous:
+            meta = dict(previous.meta)
+            meta['inputs'] = list(previous.meta['inputs'])
+            meta['channel_ids'] = dict(previous.meta.get('channel_ids', {}))
+            first_row = previous.meta['rows']
+            for subdir in ('parquet', 'inputs'):
+                for old in (previous.folder / subdir).iterdir():
+                    target = folder / subdir / old.name
+                    try:
+                        os.link(old, target)
+                    except OSError:
+                        shutil.copyfile(old, target)
+            for key in ('events', 'tests', 'event_list', 'polar'):
+                old = previous.sidecar(key)
+                if old:
+                    shutil.copyfile(old, folder / DEFAULT_FILES[key])
+        if new_log is not None:
+            incoming = save_source(new_log, inputs_dir / ('log_' + uuid.uuid4().hex + '.csv'))
+            digest = file_digest(incoming)
+            if digest in [item['sha256'] for item in meta['inputs']]:
+                raise ValueError('This exact logfile has already been added. Nothing was changed.')
+            ids = source_channel_ids(incoming) if _is_sparse_log(incoming) else {}
+            for name, channel in ids.items():
+                if name in meta['channel_ids'] and meta['channel_ids'][name] != channel:
+                    raise ValueError(f'Channel ID changed for {name}. Resolve the source mapping first.')
+                if any(k != name and v == channel for k, v in meta['channel_ids'].items()):
+                    raise ValueError(f'Channel ID {channel} has conflicting names across files.')
+            meta['channel_ids'].update(ids)
+            collector = ParquetCollector(parts_dir, first_row)
+            if _is_sparse_log(incoming):
+                parse_sparse_stream(incoming, collector=collector)
+            else:
+                parse_standard_stream(incoming, collector=collector)
+            meta['inputs'].append({'name': incoming.name, 'sha256': digest, 'rows': collector.input_rows})
+        for key, source in (sidecars or {}).items():
+            if source is None:
+                continue
+            target = folder / DEFAULT_FILES[key]
+            if key in ('events', 'tests') and previous and merge_sidecars:
+                revised = read_table_file(source)
+                if revised.empty or 'Time' not in revised:
+                    raise ValueError(f'{key}: revised file must have data and a Time column.')
+                times = pd.to_datetime(revised['Time'], errors='coerce', format='mixed', dayfirst=True)
+                if times.isna().any():
+                    raise ValueError(f'{key}: invalid Time values; no files were changed.')
+                old = read_table_file(target) if target.exists() else pd.DataFrame()
+                pd.concat([old, revised], ignore_index=True, sort=False).fillna('').drop_duplicates().to_csv(target, index=False)
+            else:
+                if key == 'polar':
+                    parse_polar(source)
+                save_source(source, target)
+        if event:
+            target = folder / DEFAULT_FILES['event_list']
+            with target.open('a', encoding='utf-8', newline='') as handle:
+                if target.stat().st_size:
+                    handle.write('\n')
+                csv.writer(handle).writerow([event['date'].strftime('%Y%m%d'), event['type'], event['event']])
+        parts = sorted(parts_dir.glob('*.parquet'))
+        if not parts:
+            raise ValueError('No log data is available to initialise the database.')
+        con = duckdb.connect(str(folder / 'nightjar.duckdb'))
+        try:
+            configure_database(con, folder)
+            paths = '[' + ','.join(_qs(str(path)) for path in parts) + ']'
+            con.execute(f'CREATE TEMP VIEW archive_log AS SELECT * FROM read_parquet({paths}, union_by_name=true)')
+            schema = con.execute('SELECT * FROM archive_log LIMIT 0').fetchdf()
+            columns = [c for c in schema if c != '_nj_row']
+            timestamp = detect_columns(schema).get('timestamp')
+            if timestamp and not pd.api.types.is_datetime64_any_dtype(schema[timestamp]):
+                raise ValueError('Timestamp type is inconsistent across log files.')
+            rows = con.execute('SELECT count(*) FROM archive_log').fetchone()[0]
+            sql_types = {row[0]: row[1] for row in con.execute('DESCRIBE archive_log').fetchall()}
+            kept, discarded, constants = [], [], {}
+            for column in columns:
+                q = _qi(column)
+                if sql_types[column] == 'VARCHAR':
+                    q = f"CASE WHEN trim({q}) = '' THEN NULL ELSE {q} END"
+                count, low, high = con.execute(f'SELECT count({q}), min({q}), max({q}) FROM archive_log').fetchone()
+                reason = 'Always empty' if count == 0 else ('Constant value' if count == rows and low == high else None)
+                if reason and column != timestamp:
+                    discarded.append({'Variable': column, 'Reason': reason})
+                    if reason == 'Constant value':
+                        constants[column] = {'value': str(low), 'type': sql_types[column]}
+                else:
+                    kept.append(column)
+            if not kept:
+                raise ValueError('No varying variables or timestamp were found.')
+            working_path = folder / 'working.parquet'
+            order = (_qi(timestamp) + ' NULLS LAST, ') if timestamp else ''
+            con.execute('COPY (SELECT ' + ','.join(map(_qi, kept + ['_nj_row'])) +
+                        ' FROM archive_log ORDER BY ' + order + '_nj_row) TO ' +
+                        _qs(str(working_path)) + ' (FORMAT PARQUET, COMPRESSION ZSTD)')
+            con.execute('CREATE VIEW working_log AS SELECT * FROM read_parquet(' + _qs(str(working_path)) + ')')
+            meta.update(version=APP_VERSION, rows=rows, timestamp=timestamp, working_columns=kept, discarded=discarded, constants=constants, raw_mapping=detect_columns(schema))
+            con.execute('CHECKPOINT')
+        finally:
+            con.close()
+        if external_signatures is not None:
+            meta['external_sidecars'] = external_signatures
+        (folder / 'metadata.json').write_text(json.dumps(meta, indent=2), encoding='utf-8')
+        pointer = root / ('CURRENT_' + uuid.uuid4().hex)
+        pointer.write_text(generation, encoding='utf-8')
+        os.replace(pointer, root / 'CURRENT')
+        return VolumeLog(root, generation)
+    except BaseException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+def sidecar_signatures(sources):
+    result = {}
+    for key in ('events', 'tests', 'event_list', 'polar'):
+        path = sources.get(key)
+        if isinstance(path, (str, Path)) and Path(path).exists():
+            stat = Path(path).stat()
+            result[key] = [str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns]
+    return result
+
+def open_volume_log(log_source, sources, root=None, preview=False):
+    root = Path(root or DATA_DIR / '.nightjar_store')
+    with volume_lock(root):
+        pointer = root / 'CURRENT'
+        if pointer.exists():
+            store = VolumeLog(root, pointer.read_text().strip(), preview=preview)
+            if isinstance(log_source, (str, Path)) and store.meta.get('baseline'):
+                stat = Path(log_source).stat()
+                signature = [str(Path(log_source).resolve()), stat.st_size, stat.st_mtime_ns]
+                if signature != store.meta['baseline']:
+                    raise ValueError('The original master logfile changed after database creation. Restore it or archive .nightjar_store and rebuild explicitly. Appended events have not been discarded.')
+            if not preview:
+                external = {k: local(None, k) for k in ('events', 'tests', 'event_list', 'polar')}
+                signatures = sidecar_signatures(external)
+                old_signatures = store.meta.get('external_sidecars', {})
+                changed = {k: external[k] for k in signatures if signatures[k] != old_signatures.get(k)}
+                if changed:
+                    return create_snapshot(root, previous=store, sidecars=changed,
+                                           merge_sidecars=False, external_signatures=signatures)
+            return store
+        baseline = None
+        if isinstance(log_source, (str, Path)):
+            stat = Path(log_source).stat()
+            baseline = [str(Path(log_source).resolve()), stat.st_size, stat.st_mtime_ns]
+        result = create_snapshot(root, new_log=log_source, sidecars={k: sources.get(k) for k in ('events', 'tests', 'event_list', 'polar')}, baseline=baseline, external_signatures=sidecar_signatures(sources))
+        result.preview = preview
+        return result
+
+def load_log_fast(src, sources=None):
+    if isinstance(src, (str, Path)):
+        return open_volume_log(src, {k: local(None, k) for k in ('events', 'tests', 'event_list', 'polar')})
+    files = session_files()
+    digest = hashlib.sha256(src.getbuffer()).hexdigest()
+    return open_volume_log(src, sources or {}, root=files.path / digest, preview=True)
+
+def build_log_predicate(ts, selected_rows, events, dates, trim, start_t, end_t):
+    if not ts:
+        return 'TRUE', [], []
+    q = _qi(ts)
+    parameters, warnings, clauses = [], [], []
+    if selected_rows is not None and not selected_rows.empty:
+        guns = find_gun_events(gun_times_in_log_clock(events))
+        if guns.empty:
+            warnings.append('No GUN entries were found in the Expedition events file. Please filter by time manually.')
+        zone = st.session_state.get('nightjar_log_timezone', 'Europe/London')
+        for day in selected_rows['date'].drop_duplicates():
+            low = pd.Timestamp(day)
+            high = low + pd.Timedelta(days=1)
+            day_guns = guns.loc[normalised_days(guns['Time']).eq(low)] if not guns.empty else pd.DataFrame()
+            if not day_guns.empty:
+                cutoff = (pd.Timestamp(day_guns.iloc[0]['_nightjar_gun_utc']) - pd.Timedelta(minutes=5)).tz_convert(zone).tz_localize(None)
+                low = max(low, cutoff)
+            elif not guns.empty:
+                warnings.append(f'No GUN entry found for {day}. Please filter this event manually if required.')
+            clauses.append(f'({q} >= ? AND {q} < ?)')
+            parameters.extend([low.to_pydatetime(), high.to_pydatetime()])
+        where = '(' + ' OR '.join(clauses) + ')'
+        if trim:
+            where += f' AND CAST({q} AS TIME) BETWEEN ? AND ?'
+            parameters.extend([start_t, end_t])
+        return where, parameters, warnings
+    if isinstance(dates, tuple) and len(dates) == 2:
+        low = pd.Timestamp.combine(dates[0], start_t if trim else time(0, 0))
+        high = pd.Timestamp.combine(dates[1], end_t if trim else time(23, 59, 59, 999999))
+        if high < low:
+            return 'TRUE', [], ['End time is before start time; no time trim was applied.']
+        return f'{q} BETWEEN ? AND ?', [low.to_pydatetime(), high.to_pydatetime()], []
+    return 'TRUE', [], []
+
+def filter_event_table(table, selected_rows, dates=None):
+    if table.empty:
+        return table, None
+    column = next((c for c in table if norm(c) in ('time', 'utc', 'timestamp', 'datetime', 'date')), None)
+    if not column:
+        return table.iloc[0:0], 'No recognised time/date column: rows cannot safely be assigned to events.'
+    times = pd.to_datetime(table[column], errors='coerce', utc=True, format='mixed', dayfirst=True)
+    days = times.dt.tz_convert(st.session_state.get('nightjar_log_timezone', 'Europe/London')).dt.tz_localize(None).dt.normalize()
+    if selected_rows is not None and not selected_rows.empty:
+        keep = days.isin(pd.DatetimeIndex(selected_rows['date']).normalize())
+    elif isinstance(dates, tuple) and len(dates) == 2:
+        keep = days.between(pd.Timestamp(dates[0]), pd.Timestamp(dates[1]))
+    else:
+        keep = pd.Series(True, index=table.index)
+    invalid = int(times.isna().sum())
+    return table.loc[keep], (f'{invalid} rows have invalid dates and cannot be assigned to events.' if invalid else None)
+
+def render_add_event(store=None):
+    st.subheader('Add event')
+    st.caption('Append to the persistent volume master. Original inputs and previous snapshots are retained. Revised EventData/TestData merge by exact row; a revised polar replaces the active polar. Overlapping log records are retained; identical file uploads are rejected.')
+    with st.form('add_event_form', clear_on_submit=True):
+        name = st.text_input('Event name')
+        event_date = st.date_input('Event date', value=datetime.now().date())
+        event_type = st.selectbox('Event type', ['Inshore', 'Offshore'])
+        logfile = st.file_uploader('Event logfile', type=['csv', 'txt'], key='add_event_log')
+        revised_events = st.file_uploader('Revised EventData (optional)', type=['csv', 'txt'], key='add_event_events')
+        revised_tests = st.file_uploader('Revised TestData (optional)', type=['csv', 'txt'], key='add_event_tests')
+        revised_polar = st.file_uploader('Revised polar (optional)', type=['txt', 'csv', 'pol'], key='add_event_polar')
+        submitted = st.form_submit_button('Add event', disabled=bool(store and store.preview))
+    if store and store.preview:
+        st.info('Remove the sidebar log override before adding to the persistent master.')
+    if submitted:
+        if not name.strip() or logfile is None:
+            st.error('An event name and logfile are required. Nothing was changed.')
+            return
+        try:
+            root = DATA_DIR / '.nightjar_store'
+            with volume_lock(root):
+                pointer = root / 'CURRENT'
+                current = VolumeLog(root, pointer.read_text().strip()) if pointer.exists() else None
+                updated = create_snapshot(root, previous=current, new_log=logfile,
+                    sidecars={'events': revised_events or (local(None, 'events') if current is None else None),
+                              'tests': revised_tests or (local(None, 'tests') if current is None else None),
+                              'polar': revised_polar or (local(None, 'polar') if current is None else None),
+                              'event_list': local(None, 'event_list') if current is None else None},
+                    event={'date': event_date, 'type': event_type, 'event': name.strip()})
+            st.session_state['nightjar_import_notice'] = f'Added {name.strip()}. Persistent master: {updated.meta["rows"]:,} own-boat records.'
+            st.rerun()
+        except Exception as exc:
+            st.error(f'Event was not added; committed data is unchanged: {exc}')
+
+def _write_export(handle, columns, rows, timestamp, channel_ids, sparse=False):
+    writer = csv.writer(handle)
+    channels = [c for c in columns if c not in ('_nj_row', 'Boat', timestamp)]
+    if sparse:
+        channels = [c for c in channels if c in channel_ids]
+        writer.writerow(['!Expedition log export Nightjar ' + APP_VERSION])
+        writer.writerow(['!Boat', 'Utc'] + channels)
+        writer.writerow(['!Boat', '0'] + [channel_ids[c] for c in channels])
+    else:
+        writer.writerow(['Boat', 'Utc'] + channels)
+    positions = {c: i for i, c in enumerate(columns)}
+    for row in rows:
+        value = row[positions[timestamp]] if timestamp in positions else None
+        if value is None or pd.isna(value):
+            raise ValueError('Cannot export a record without a valid timestamp.')
+        value = pd.Timestamp(value)
+        if value.tzinfo is not None:
+            value = value.tz_localize(None)
+        serial = (value - pd.Timestamp('1899-12-30')).total_seconds() / 86400.0
+        boat = row[positions['Boat']] if 'Boat' in positions else 0
+        output = [int(float(boat)) if not pd.isna(boat) else 0, format(serial, '.12f')]
+        for column in channels:
+            cell = row[positions[column]]
+            if sparse:
+                if cell is not None and not pd.isna(cell):
+                    output.extend([channel_ids[column], cell])
+            else:
+                output.append('' if cell is None or pd.isna(cell) else cell)
+        writer.writerow(output)
+
+def export_log(store, target, where='TRUE', parameters=(), frame=None, sparse=False, timestamp=None):
+    ts = timestamp or store.meta.get('timestamp')
+    if not ts:
+        raise ValueError('Map a timestamp before exporting an Expedition log.')
+    target = Path(target)
+    try:
+        with target.open('w', encoding='utf-8', newline='') as handle:
+            if frame is not None:
+                columns = [c for c in frame if c in store.columns or c == detect_columns(frame).get('vmg_pct')]
+                if ts not in columns:
+                    raise ValueError('The displayed dataset has no timestamp.')
+                _write_export(handle, columns, frame[columns].itertuples(index=False, name=None), ts, store.meta.get('channel_ids', {}), sparse)
+            else:
+                with store.connection() as con:
+                    paths = '[' + ','.join(_qs(str(path)) for path in sorted((store.folder / 'parquet').glob('*.parquet'))) + ']'
+                    cursor = con.execute('SELECT * EXCLUDE (_nj_row) FROM read_parquet(' + paths + ', union_by_name=true) WHERE ' + where + ' ORDER BY ' + _qi(ts) + ' NULLS LAST, _nj_row', list(parameters))
+                    columns = [d[0] for d in cursor.description]
+                    def rows():
+                        while True:
+                            batch = cursor.fetchmany(10000)
+                            if not batch:
+                                break
+                            yield from batch
+                    _write_export(handle, columns, rows(), ts, store.meta.get('channel_ids', {}), sparse)
+        return target
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+
+def render_log_downloads(store, where, parameters, displayed, timestamp):
+    with st.expander('Download master / displayed log'):
+        scopes = ['Full master', 'Sidebar-filtered master']
+        if timestamp and timestamp in displayed:
+            scopes.append('Current tab data')
+        if st.session_state.get('export_scope') not in scopes:
+            st.session_state.pop('export_scope', None)
+        scope = st.radio('Records to download', scopes, horizontal=True, key='export_scope')
+        formats = ['Expedition extracted CSV']
+        if store.meta.get('channel_ids'):
+            formats.append('Expedition sparse log (source IDs)')
+        fmt = st.selectbox('Log format', formats, key='export_format')
+        st.caption('CSV uses Boat/Utc and Excel-date timestamps in the unchanged source log clock. Sparse export uses source IDs only; calculated channels without IDs are omitted. Current-tab export contains plotted/averaged native channels, not display-only absolute-value or label columns. Verify import in your Expedition version before replacing an original log.')
+        if st.button('Prepare log download', key='prepare_export'):
+            try:
+                target = session_files().path / ('nightjar_' + uuid.uuid4().hex + '.csv')
+                export_log(store, target,
+                    where=where if scope == 'Sidebar-filtered master' else 'TRUE',
+                    parameters=parameters if scope == 'Sidebar-filtered master' else (),
+                    frame=displayed if scope == 'Current tab data' else None,
+                    sparse=fmt.startswith('Expedition sparse'), timestamp=timestamp)
+                with target.open('rb') as handle:
+                    st.download_button('Download prepared log', handle, f'nightjar_{APP_VERSION}.csv', 'text/csv', key='download_prepared', on_click='ignore')
+                target.unlink(missing_ok=True)
+            except Exception as exc:
+                st.error(f'Could not prepare export: {exc}')
+
+
+def render_file_viewer(src, selected_rows=None, dates=None):
     st.subheader("File viewer")
     choice = st.radio("File to view", ["EventData", "TestData"], horizontal=True, key="viewer_file")
     source = src["events" if choice == "EventData" else "tests"]
@@ -1330,7 +1795,10 @@ def render_file_viewer(src):
     else:
         try:
             table = read_table_file(source)
-            st.caption(f"{choice}: {len(table):,} rows, {len(table.columns):,} columns. Complete source file; event filters do not restrict this view.")
+            table, warning = filter_event_table(table, selected_rows, dates)
+            if warning:
+                st.warning(warning)
+            st.caption(f"{choice}: {len(table):,} rows, {len(table.columns):,} columns. Filtered by selected event dates (or date range); source cell values are unchanged.")
             st.dataframe(table, width="stretch", hide_index=True)
         except Exception as exc:
             st.error(f"Could not read {choice}: {exc}")
@@ -1365,7 +1833,9 @@ def main():
 
     pass
     if st.sidebar.button("Sign out", key="nightjar_sign_out"):
-        st.session_state["nightjar_authenticated"] = False
+        session_files.clear()
+        st.session_state.clear()
+        release_process_memory()
         st.rerun()
     st.sidebar.markdown("""
     <style>
@@ -1387,25 +1857,39 @@ def main():
     defs = [("log","Expedition log",["csv","txt"]),("polar","Target polar",["txt","csv","pol"]),("events","Expedition events",["csv","txt"]),("event_list","Event list",["txt","csv"]),("tests","Expedition tests",["csv"]),("sail_chart","Sail selection chart",["xml"]),("debrief","Debrief notes",["txt","md","docx"])]
     ups = {k: st.sidebar.file_uploader(n, type=t, key=f"file_{k}") for k,n,t in defs}
     src = {k: (v if k == "debrief" else local(v,k)) for k,v in ups.items()}
-    if not src["log"] and active_page == "File viewer":
-        render_file_viewer(src)
-        return
-    if not src["log"]:
+    persistent_pointer = DATA_DIR / '.nightjar_store' / 'CURRENT'
+    if not src["log"] and not persistent_pointer.exists():
+        if active_page == "File viewer":
+            render_file_viewer(src)
+            return
+        if active_page == "Settings":
+            render_add_event()
+            return
         with event_filter_container:
             st.subheader("Event filters")
             st.caption("Load a log and event list to enable filtering.")
-        st.info("Upload a log or place the reference files in the data folder in the /Data volume")
+        st.info("Upload a log or place reference files in /Data. Settings can also add the first event.")
         st.stop()
     try:
-        df = load_log_fast(src["log"])
-    except Exception as e:
-        st.error(f"Could not read log: {e}")
+        store = load_log_fast(src["log"], src) if src["log"] else open_volume_log(None, src)
+        df = store.schema_frame()
+        for key in ('events', 'tests', 'event_list', 'polar'):
+            if ups.get(key) is None:
+                src[key] = store.sidecar(key) or src.get(key)
+        events = load_events_fast(src["events"])
+        event_list = load_event_list_fast(src["event_list"])
+        polar = load_polar_fast(src["polar"])
+        probe = detect_columns(df)
+        calc_mapping = store.meta.get('raw_mapping', probe)
+        if polar is not None and all(calc_mapping.get(k) for k in ('vmg', 'tws', 'twa')) and not probe.get('vmg_pct'):
+            df['VMG_PCT'] = pd.Series(dtype='float32')
+    except Exception as exc:
+        st.error(f"Could not open persistent log: {exc}")
         st.stop()
     memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
-    events = load_events_fast(src["events"])
-    event_list = load_event_list_fast(src["event_list"])
-    polar = load_polar_fast(src["polar"])
-    df = ensure_vmg_pct(df, polar)
+    notice = st.session_state.pop('nightjar_import_notice', None)
+    if notice:
+        st.success(notice)
 
     m = detect_columns(df)
     mapping_keys = ("timestamp","bsp","twa","tws","awa","vmg","vmg_pct","heel","drift","lat","lon")
@@ -1415,12 +1899,17 @@ def main():
     enabled = enabled_variables(df.columns)
     if active_page == "Settings":
         render_settings(df, m, mapping_keys)
+        st.subheader("Discarded variables")
+        st.caption("Empty/constant channels are excluded from working queries, not destroyed: archived inputs retain them for full exports and future reclassification. A timestamp key is retained. A value with missing gaps is not treated as constant.")
+        discarded = pd.DataFrame(store.meta.get('discarded', []), columns=['Variable', 'Reason'])
+        st.dataframe(discarded, width='stretch', hide_index=True)
+        render_add_event(store)
         m.update({k: v for k, v in st.session_state.get("nightjar_mapping", {}).items() if v is None or v in df.columns})
         enabled = enabled_variables(df.columns)
     ts,bsp,twa,tws,vmg,vmg_pct,heel,drift,awa = [m.get(k) for k in ("timestamp","bsp","twa","tws","vmg","vmg_pct","heel","drift","awa")]
 
-    row_mask = np.ones(len(df), dtype=bool)
-    filtered_positions = np.arange(len(df), dtype=np.int64)
+    lower_time, upper_time = store.bounds(ts)
+    good = pd.Series([lower_time, upper_time]).dropna()
     selected_events = []
     selected_event_dates = []
     selected_rows = pd.DataFrame(columns=["date", "type", "event"])
@@ -1429,7 +1918,6 @@ def main():
     with event_filter_container:
         st.subheader("Event filters")
         if ts and pd.api.types.is_datetime64_any_dtype(df[ts]):
-            good = df[ts].dropna()
             if not good.empty:
 
                 filtered_event_list = event_list.copy()
@@ -1468,55 +1956,47 @@ def main():
             dates, start_t, end_t = None, time(0, 0), time(23, 59)
             st.caption("Map a timestamp column to enable event filtering.")
 
-    if ts and pd.api.types.is_datetime64_any_dtype(df[ts]):
-        timestamps = df[ts]
-        if selected_events:
-            selected_rows = filtered_event_list.loc[
-                filtered_event_list["event"].isin(selected_events)
-            ].copy()
-            selected_event_dates = selected_rows["date"].tolist()
-            selected_days = pd.DatetimeIndex(selected_event_dates).normalize()
-            row_mask &= normalised_days(timestamps).isin(selected_days).to_numpy()
-            gun_mask, gun_warnings = gun_mask_for_dates(
-                timestamps, events, selected_event_dates
-            )
-            row_mask &= gun_mask
-            pending_gun_warnings = gun_warnings
-            if trim_data:
-                seconds = seconds_since_midnight(timestamps)
-                start_seconds = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
-                end_seconds = end_t.hour * 3600 + end_t.minute * 60 + end_t.second
-                row_mask &= (seconds >= start_seconds) & (seconds <= end_seconds)
-                del seconds
-        elif isinstance(dates, tuple) and len(dates) == 2:
-            date_start = pd.Timestamp.combine(
-                dates[0], start_t if trim_data else time(0, 0)
-            )
-            date_end = pd.Timestamp.combine(
-                dates[1], end_t if trim_data else time(23, 59, 59, 999999)
-            )
-            if date_end < date_start:
-                st.sidebar.warning("End time is before start time; no time trim was applied.")
-            else:
-                row_mask &= timestamps.between(date_start, date_end).to_numpy()
-        filtered_positions = np.flatnonzero(row_mask)
-        del row_mask
+    if selected_events:
+        selected_rows = filtered_event_list.loc[filtered_event_list['event'].isin(selected_events)].copy()
+        selected_event_dates = selected_rows['date'].tolist()
+    where, query_parameters, pending_gun_warnings = build_log_predicate(
+        ts, selected_rows, events, dates, trim_data, start_t, end_t)
 
     multi_event = len(selected_events) > 1
     st.session_state["pending_gun_warnings"] = locals().get("pending_gun_warnings", [])
 
     debrief_text = read_debrief_file(src.get("debrief"))
+    nums_available = [c for c in df.select_dtypes(include=np.number).columns if c in enabled]
+    for widget_key in ('gps_colour_by', 'var_x', 'var_y', 'var_colour'):
+        value = st.session_state.get(widget_key)
+        if value is not None and value not in nums_available and not (widget_key == 'var_colour' and value == 'None'):
+            st.session_state.pop(widget_key, None)
     if active_page == "Overview":
         page_columns = [ts, bsp, tws, vmg, vmg_pct, heel, twa]
     elif active_page == "Event summary":
         page_columns = [ts, twa, tws, awa, bsp, vmg, vmg_pct]
     elif active_page == "Polar analysis":
         page_columns = [ts, bsp, twa, tws, awa, vmg, vmg_pct, heel, drift, m.get("lat"), m.get("lon")]
-    elif active_page in ("Map View", "Variable plot"):
-        page_columns = [ts] + df.select_dtypes(include=np.number).columns.tolist()
+    elif active_page == "Map View":
+        default_colour = vmg if vmg in nums_available else (bsp if bsp in nums_available else (nums_available[0] if nums_available else None))
+        page_columns = [ts, m.get('lat'), m.get('lon'), st.session_state.get('gps_colour_by', default_colour), twa, tws, awa, heel, vmg, vmg_pct, drift, bsp]
+    elif active_page == "Variable plot":
+        default_x = twa if twa in nums_available else (nums_available[0] if nums_available else None)
+        default_y = bsp if bsp in nums_available else (nums_available[min(1, len(nums_available)-1)] if nums_available else None)
+        page_columns = [ts, st.session_state.get('var_x', default_x), st.session_state.get('var_y', default_y), st.session_state.get('var_colour', tws), tws, twa]
+    elif active_page == "Files and sail chart":
+        page_columns = [ts, twa, tws]
     else:
-        page_columns = None
-    filtered = select_filtered_rows(df, filtered_positions, page_columns)
+        page_columns = []
+    if vmg_pct and vmg_pct in page_columns:
+        page_columns += [calc_mapping.get(k) for k in ('vmg', 'tws', 'twa')]
+    filtered = store.query(page_columns, where, query_parameters)
+    if vmg_pct and vmg_pct in page_columns:
+        if vmg_pct not in filtered:
+            filtered[vmg_pct] = pd.Series(index=filtered.index, dtype='float32')
+        filtered = ensure_vmg_pct(filtered, polar)
+        filtered.drop(columns=[c for c in filtered if c in store.meta.get('constants', {})], inplace=True)
+    displayed_data = filtered
 
     if active_page == "Overview":
         colour_group_overview = colour_group_controls("overview", multi_event, bool(twa))
@@ -1615,6 +2095,7 @@ def main():
         elif colour_group_polar == "Tack":
             local_data = add_tack_labels(local_data, twa)
         st.session_state["nightjar_avg_settings"] = {"seconds":int(avg_sec), "max_tws":max_tws_var, "max_bsp":max_bsp_var}
+        displayed_data = local_data
         st.caption(f"Plotting {len(local_data):,} records | {avg_note}. Half polar uses 0° to 180°.")
         if bsp and twa:
             st.plotly_chart(polar_plot(local_data, m, polar, target, layout.startswith("Half"), plot_space, (yr_min,yr_max), colour_group_polar), width="stretch")
@@ -1624,7 +2105,7 @@ def main():
         lat, lon = m.get("lat"), m.get("lon")
         if lat and lon and int((filtered[lat].notna() & filtered[lon].notna()).sum()) > 1:
             settings = st.session_state.get("nightjar_avg_settings", {"seconds": 1, "max_tws": 99.0, "max_bsp": 99.0})
-            nums = [c for c in filtered.select_dtypes(include=np.number).columns if c in enabled]
+            nums = nums_available
             default_colour = vmg if vmg in nums else (bsp if bsp in nums else (nums[0] if nums else None))
             if not nums:
                 st.warning("No numeric channels are available to colour the GPS track.")
@@ -1723,16 +2204,20 @@ def main():
                     map=dict(style="open-street-map", center=centre, zoom=10),
                     template="plotly_dark", height=675, margin=dict(l=0, r=0, t=35, b=0), title=gps_title,
                 )
+                displayed_data = d
                 st.plotly_chart(fig, width="stretch")
         else:
             st.info("Latitude and longitude are not available")
         if not events.empty:
-            st.dataframe(round_numeric_df(events), width="stretch", height=240)
+            visible_events, event_warning = filter_event_table(events, selected_rows, dates)
+            if event_warning:
+                st.warning(event_warning)
+            st.dataframe(round_numeric_df(visible_events), width="stretch", height=240)
 
     if active_page == "Variable plot":
         colour_group_var = colour_group_controls("var", multi_event, bool(twa))
         categorical_colour_var = bool(colour_group_var)
-        nums = [c for c in filtered.select_dtypes(include=np.number).columns if c in enabled]
+        nums = nums_available
         if len(nums) < 2:
             st.info("At least two numeric variables are required")
         else:
@@ -1892,10 +2377,11 @@ def main():
                 fig.add_annotation(text=f"Angular variable: {xn}", x=0.5, y=-0.12, xref="paper", yref="paper", showarrow=False)
             fig.update_layout(template="plotly_dark", height=635, title=f"{yn} against {xn} ({avg_note})", uirevision="nightjar-variable-axes")
             st.plotly_chart(fig, width="stretch")
+            displayed_data = vd
             st.caption(f"Displaying {len(vd):,} records")
 
     if active_page == "File viewer":
-        render_file_viewer(src)
+        render_file_viewer(src, selected_rows, dates)
 
     if active_page == "Files and sail chart":
         if src["sail_chart"]:
@@ -1912,12 +2398,22 @@ def main():
                 st.plotly_chart(fig, width="stretch")
                 st.dataframe(round_numeric_df(sails), width="stretch", height=270)
             except Exception as e: st.warning(f"Sail chart could not be parsed: {e}")
-        st.download_button("Download filtered log CSV", filtered.to_csv(index=False).encode("utf-8"), f"nightjar_filtered_log_{APP_VERSION}.csv", "text/csv", key="download_filtered")
-        session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":len(filtered), "mapping":m}
-        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), "nightjar_session_0.10.0.json", "application/json", key="download_session")
+        if st.button("Prepare filtered log CSV", key="prepare_legacy_csv"):
+            with store.connection() as con:
+                paths = '[' + ','.join(_qs(str(path)) for path in sorted((store.folder / 'parquet').glob('*.parquet'))) + ']'
+                legacy = con.execute('SELECT * EXCLUDE (_nj_row) FROM read_parquet(' + paths + ', union_by_name=true) WHERE ' + where + ' ORDER BY ' + (_qi(ts) + ', ' if ts else '') + '_nj_row', query_parameters).fetchdf()
+            legacy = ensure_vmg_pct(legacy, polar)
+            st.download_button("Download filtered log CSV", legacy.to_csv(index=False).encode("utf-8"), f"nightjar_filtered_log_{APP_VERSION}.csv", "text/csv", key="download_filtered", on_click='ignore')
+        session = {"version":APP_VERSION, "created_utc":datetime.now(UTC).isoformat().replace("+00:00", "Z"), "rows":store.count(where, query_parameters), "mapping":m}
+        st.download_button("Download session settings", json.dumps(session,indent=2).encode(), f"nightjar_session_{APP_VERSION}.json", "application/json", key="download_session")
+    render_log_downloads(store, where, query_parameters, displayed_data, ts)
     # Refresh after the active page has been built so the sidebar reports the
     # process resident set, including the current plot's temporary objects.
     gc.collect()
     memory_placeholder.metric("Process memory", f"{_rss_mb():.0f} MiB")
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        release_process_memory()
